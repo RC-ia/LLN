@@ -13,6 +13,10 @@ SPECIAL_TOKENS = [
 DEFAULT_DATASET = Path("data/dataset.json")
 DEFAULT_DICTIONARY = Path("data/dictionary.json")
 
+SECTION_PROMPT = 0
+SECTION_THINK = 1
+SECTION_ANSWER = 2
+
 
 def normalize_text(text: str) -> str:
     text = str(text).lower().strip()
@@ -23,11 +27,7 @@ def normalize_text(text: str) -> str:
 def load_records(dataset_path: str | Path) -> list[tuple[str, str | None, str]]:
     dataset_path = Path(dataset_path)
     if dataset_path.suffix.lower() != ".json":
-        lines = [
-            normalize_text(line)
-            for line in dataset_path.read_text(encoding="utf-8").splitlines()
-            if normalize_text(line)
-        ]
+        lines = [normalize_text(line) for line in dataset_path.read_text(encoding="utf-8").splitlines() if normalize_text(line)]
         return [(line, None, "") for line in lines]
 
     raw = json.loads(dataset_path.read_text(encoding="utf-8"))
@@ -63,10 +63,7 @@ def record_texts(records: list[tuple[str, str | None, str]]) -> list[str]:
     return texts
 
 
-def create_dictionary_from_dataset(
-    dataset_path: str | Path,
-    dictionary_path: str | Path = DEFAULT_DICTIONARY,
-):
+def create_dictionary_from_dataset(dataset_path: str | Path, dictionary_path: str | Path = DEFAULT_DICTIONARY):
     records = load_records(dataset_path)
     words = " ".join(record_texts(records)).split()
     word_to_id = {token: i for i, token in enumerate(SPECIAL_TOKENS)}
@@ -76,10 +73,7 @@ def create_dictionary_from_dataset(
 
     dictionary_path = Path(dictionary_path)
     dictionary_path.parent.mkdir(parents=True, exist_ok=True)
-    dictionary_path.write_text(
-        json.dumps(word_to_id, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    dictionary_path.write_text(json.dumps(word_to_id, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return word_to_id
 
 
@@ -91,108 +85,99 @@ def load_dictionary(path: str | Path):
 
 
 def encode_text(text: str, word_to_id: dict[str, int]) -> list[int]:
-    return [
-        word_to_id.get(word, word_to_id["<UNK>"])
-        for word in normalize_text(text).split()
-    ]
+    return [word_to_id.get(word, word_to_id["<UNK>"]) for word in normalize_text(text).split()]
 
 
-def encode_record(
-    record: tuple[str, str | None, str],
-    word_to_id: dict[str, int],
-) -> tuple[list[int], list[int]]:
+def encode_record(record: tuple[str, str | None, str], word_to_id: dict[str, int]) -> tuple[list[int], list[int]]:
     user_text, reasoning, answer = record
     ids = [word_to_id["<BOS>"], word_to_id["<USER>"]]
-    sections = [0, 0]
+    sections = [SECTION_PROMPT, SECTION_PROMPT]
 
     user_ids = encode_text(user_text, word_to_id)
     ids += user_ids
-    sections += [0] * len(user_ids)
-
+    sections += [SECTION_PROMPT] * len(user_ids)
     ids.append(word_to_id["</USER>"])
-    sections.append(0)
+    sections.append(SECTION_PROMPT)
 
     if reasoning:
         ids.append(word_to_id["<THINK>"])
-        sections.append(1)
+        sections.append(SECTION_THINK)
         think_ids = encode_text(reasoning, word_to_id)
         ids += think_ids
-        sections += [1] * len(think_ids)
+        sections += [SECTION_THINK] * len(think_ids)
         ids.append(word_to_id["</THINK>"])
-        sections.append(1)
+        sections.append(SECTION_THINK)
 
     ids.append(word_to_id["<ANSWER>"])
-    sections.append(2)
+    sections.append(SECTION_ANSWER)
     answer_ids = encode_text(answer, word_to_id)
     ids += answer_ids
-    sections += [2] * len(answer_ids)
+    sections += [SECTION_ANSWER] * len(answer_ids)
     ids.append(word_to_id["</ANSWER>"])
-    sections.append(2)
+    sections.append(SECTION_ANSWER)
     ids.append(word_to_id["<EOS>"])
-    sections.append(2)
+    sections.append(SECTION_ANSWER)
     return ids, sections
 
 
 def encode_prompt(text: str, word_to_id: dict[str, int]) -> list[int]:
-    return [
-        word_to_id["<BOS>"],
-        word_to_id["<USER>"],
-        *encode_text(text, word_to_id),
-        word_to_id["</USER>"],
-        word_to_id["<THINK>"],
-    ]
+    return [word_to_id["<BOS>"], word_to_id["<USER>"], *encode_text(text, word_to_id), word_to_id["</USER>"], word_to_id["<THINK>"]]
 
 
-def build_dataset(
-    dataset_path: str | Path = DEFAULT_DATASET,
-    dictionary_path: str | Path = DEFAULT_DICTIONARY,
-    repeats: int = 1,
-    seed: int = 1234,
-    return_sections: bool = False,
-):
+def build_dataset(dataset_path: str | Path = DEFAULT_DATASET, dictionary_path: str | Path = DEFAULT_DICTIONARY,
+                  repeats: int = 1, seed: int = 1234, return_sections: bool = False):
     records = load_records(dataset_path)
     word_to_id = create_dictionary_from_dataset(dataset_path, dictionary_path)
     rng = random.Random(seed)
     sequences = [encode_record(record, word_to_id) for record in records]
-
-    # Materialize repeated complete examples. A training sample is never
-    # assembled by concatenating unrelated records or cutting across them.
     selected = [rng.choice(sequences) for _ in range(max(1, repeats))]
     return selected
 
 
-def make_batch(
-    data,
-    batch_size: int,
-    seq_len: int,
-    device,
-    sections=None,
-):
+def _window_start(ids: list[int], sections: list[int], seq_len: int) -> int:
+    """Choose a bounded window inside one record, never across records."""
+    if len(ids) <= seq_len + 1:
+        return 0
+
+    max_start = len(ids) - (seq_len + 1)
+    prompt_end = next((i for i, section in enumerate(sections) if section != SECTION_PROMPT), len(sections))
+    answer_start = next((i for i, section in enumerate(sections) if section == SECTION_ANSWER), len(sections))
+
+    candidates = [0]
+    if answer_start < len(ids):
+        candidates.append(min(max(0, answer_start - seq_len // 2), max_start))
+    if prompt_end < len(ids):
+        candidates.append(min(max(0, prompt_end - seq_len // 4), max_start))
+    return random.choice(candidates)
+
+
+def make_batch(data, batch_size: int, seq_len: int, device, sections=None):
     if not data:
         raise ValueError("Dataset contains no training examples")
     if sections is not None:
-        raise ValueError("sections argument is no longer used; pass complete records from build_dataset")
+        raise ValueError("sections argument is no longer used; build_dataset returns complete records")
+    if seq_len < 8:
+        raise ValueError("seq_len must be at least 8")
 
     chosen = [random.choice(data) for _ in range(batch_size)]
     x_rows, y_rows, w_rows = [], [], []
     pad_id = 0
 
     for ids, sec in chosen:
-        # Keep the beginning of the record and truncate only when a single
-        # example exceeds the model sequence length.
-        ids = ids[: seq_len + 1]
-        sec = sec[: seq_len + 1]
-        if len(ids) < 2:
+        start = _window_start(ids, sec, seq_len)
+        window_ids = ids[start:start + seq_len + 1]
+        window_sec = sec[start:start + seq_len + 1]
+        if len(window_ids) < 2:
             continue
 
-        x_ids = ids[:-1]
-        y_ids = ids[1:]
-        y_sec = sec[1:]
+        x_ids = window_ids[:-1]
+        y_ids = window_ids[1:]
+        y_sec = window_sec[1:]
         pad_count = seq_len - len(x_ids)
         if pad_count > 0:
-            x_ids = x_ids + [pad_id] * pad_count
-            y_ids = y_ids + [pad_id] * pad_count
-            y_sec = y_sec + [-1] * pad_count
+            x_ids += [pad_id] * pad_count
+            y_ids += [pad_id] * pad_count
+            y_sec += [-1] * pad_count
 
         x_rows.append(x_ids[:seq_len])
         y_rows.append(y_ids[:seq_len])
