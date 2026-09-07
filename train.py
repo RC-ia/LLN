@@ -133,7 +133,11 @@ def main():
     print("long_record_policy=preserve_prompt_and_answer_truncate_think")
     print(f"resume={resumed} starting_step={start_step}")
 
-    scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda" and dtype == torch.float16))
+    # Pure FP16 keeps the model weights and optimizer state in half precision.
+    # GradScaler cannot unscale native FP16 parameter gradients, so use explicit
+    # loss scaling and gradient unscaling here instead.
+    grad_scale = 1024.0 if (device.type == "cuda" and dtype == torch.float16) else 1.0
+
     model.train()
     start = time.perf_counter()
     last_log = start
@@ -144,27 +148,45 @@ def main():
         loss_weights = sections_to_weights(batch_sections, args.think_weight, args.answer_weight)
         optimizer.zero_grad(set_to_none=True)
 
-        if scaler.is_enabled():
-            with torch.autocast(device_type="cuda", dtype=dtype):
-                _, loss = model(x, y, loss_weights=loss_weights)
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            scaler.step(optimizer)
-            scaler.update()
+        with torch.autocast(
+            device_type=device.type,
+            dtype=dtype,
+            enabled=(dtype != torch.float32),
+        ):
+            _, loss = model(x, y, loss_weights=loss_weights)
+
+        if grad_scale != 1.0:
+            (loss * grad_scale).backward()
+            found_inf = False
+            inv_scale = 1.0 / grad_scale
+            for param in model.parameters():
+                if param.grad is None:
+                    continue
+                param.grad.data.mul_(inv_scale)
+                if not torch.isfinite(param.grad).all():
+                    found_inf = True
+                    break
+            if found_inf:
+                optimizer.zero_grad(set_to_none=True)
+                grad_scale = max(1.0, grad_scale / 2.0)
+                continue
         else:
-            with torch.autocast(device_type=device.type, dtype=dtype, enabled=(dtype != torch.float32)):
-                _, loss = model(x, y, loss_weights=loss_weights)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
+
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+
+        if dtype == torch.float16 and device.type == "cuda":
+            # Increase scaling slowly when the current scale remains finite.
+            if grad_scale < 65536.0:
+                grad_scale = min(65536.0, grad_scale * 1.001)
 
         if local_step == 1 or local_step % args.log_every == 0 or local_step == args.steps:
             now = time.perf_counter()
             elapsed = max(now - last_log, 1e-9)
             window_steps = args.log_every if local_step > args.log_every else local_step
             tokens_s = (args.batch_size * args.seq_len * window_steps) / elapsed
-            print(f"step={global_step:6d} loss={loss.item():.6f} tok/s={tokens_s:,.0f}")
+            print(f"step={global_step:6d} loss={loss.item():.6f} tok/s={tokens_s:,.0f} grad_scale={grad_scale:g}")
             last_log = now
 
     torch.save({
@@ -178,6 +200,7 @@ def main():
             "loss_scheme_version": LOSS_SCHEME_VERSION,
             "think_weight": args.think_weight,
             "answer_weight": args.answer_weight,
+            "dtype": str(dtype),
         },
     }, save_path)
     print(f"saved={save_path}")
