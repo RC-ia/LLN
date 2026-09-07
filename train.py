@@ -22,7 +22,7 @@ def pick_dtype(name: str, device: torch.device):
 
 def main():
     parser = argparse.ArgumentParser(description="Train LLN on integer token IDs")
-    parser.add_argument("--dataset", default="data/dataset.txt")
+    parser.add_argument("--dataset", default="data/dataset.json")
     parser.add_argument("--dictionary", default="data/dictionary.json")
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
     parser.add_argument("--dtype", default="float32", choices=["float32", "float16", "bfloat16"])
@@ -48,7 +48,6 @@ def main():
 
     dtype = pick_dtype(args.dtype, device)
 
-    # Build the vocabulary from the current dataset before creating the model.
     data = build_dataset(args.dataset, args.dictionary, repeats=args.repeats)
     word_to_id, _ = load_dictionary(args.dictionary)
 
@@ -73,8 +72,6 @@ def main():
 
         if comparable != model_cfg:
             print("checkpoint architecture/vocabulary differs from current dataset/config; starting a new model")
-            print(f"saved_config={comparable}")
-            print(f"current_config={model_cfg}")
             checkpoint = None
         else:
             resumed = True
@@ -101,7 +98,6 @@ def main():
     scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda" and dtype == torch.float16))
 
     model.train()
-    total_tokens = 0
     start = time.perf_counter()
     last_log = start
 
@@ -124,8 +120,6 @@ def main():
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
-
-        total_tokens += x.numel()
 
         if local_step == 1 or local_step % args.log_every == 0 or local_step == args.steps:
             now = time.perf_counter()
