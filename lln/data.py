@@ -21,20 +21,13 @@ def normalize_text(text: str) -> str:
 
 
 def load_records(dataset_path: str | Path) -> list[tuple[str, str | None, str]]:
-    """Load plain-text lines or chat records with optional reasoning."""
     dataset_path = Path(dataset_path)
     if dataset_path.suffix.lower() != ".json":
-        lines = [
-            normalize_text(line)
-            for line in dataset_path.read_text(encoding="utf-8").splitlines()
-            if normalize_text(line)
-        ]
+        lines = [normalize_text(line) for line in dataset_path.read_text(encoding="utf-8").splitlines() if normalize_text(line)]
         return [(line, None, "") for line in lines]
-
     raw = json.loads(dataset_path.read_text(encoding="utf-8"))
     if not isinstance(raw, list):
         raise ValueError("JSON dataset must contain a top-level list")
-
     records = []
     for item in raw:
         messages = item.get("messages", []) if isinstance(item, dict) else []
@@ -47,7 +40,6 @@ def load_records(dataset_path: str | Path) -> list[tuple[str, str | None, str]]:
         reasoning = normalize_text(assistant.get("reasoning_content", "")) or None
         if user_text and answer_text:
             records.append((user_text, reasoning, answer_text))
-
     if not records:
         raise ValueError(f"No valid user/assistant records found in {dataset_path}")
     return records
@@ -66,20 +58,14 @@ def record_texts(records: list[tuple[str, str | None, str]]) -> list[str]:
 
 def create_dictionary_from_dataset(dataset_path: str | Path, dictionary_path: str | Path = DEFAULT_DICTIONARY):
     records = load_records(dataset_path)
-    texts = record_texts(records)
-    words = " ".join(texts).split()
-
+    words = " ".join(record_texts(records)).split()
     word_to_id = {token: i for i, token in enumerate(SPECIAL_TOKENS)}
     for word in sorted(set(words)):
         if word not in word_to_id:
             word_to_id[word] = len(word_to_id)
-
     dictionary_path = Path(dictionary_path)
     dictionary_path.parent.mkdir(parents=True, exist_ok=True)
-    dictionary_path.write_text(
-        json.dumps(word_to_id, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    dictionary_path.write_text(json.dumps(word_to_id, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return word_to_id
 
 
@@ -94,53 +80,65 @@ def encode_text(text: str, word_to_id: dict[str, int]) -> list[int]:
     return [word_to_id.get(word, word_to_id["<UNK>"]) for word in normalize_text(text).split()]
 
 
-def encode_record(record: tuple[str, str | None, str], word_to_id: dict[str, int]) -> list[int]:
+def encode_record(record: tuple[str, str | None, str], word_to_id: dict[str, int]) -> tuple[list[int], list[int]]:
     user_text, reasoning, answer = record
     ids = [word_to_id["<BOS>"], word_to_id["<USER>"]]
-    ids += encode_text(user_text, word_to_id)
+    sections = [0, 0]
+    user_ids = encode_text(user_text, word_to_id)
+    ids += user_ids
+    sections += [0] * len(user_ids)
     ids.append(word_to_id["</USER>"])
+    sections.append(0)
     if reasoning:
         ids.append(word_to_id["<THINK>"])
-        ids += encode_text(reasoning, word_to_id)
+        sections.append(1)
+        think_ids = encode_text(reasoning, word_to_id)
+        ids += think_ids
+        sections += [1] * len(think_ids)
         ids.append(word_to_id["</THINK>"])
+        sections.append(1)
     ids.append(word_to_id["<ANSWER>"])
-    ids += encode_text(answer, word_to_id)
+    sections.append(2)
+    answer_ids = encode_text(answer, word_to_id)
+    ids += answer_ids
+    sections += [2] * len(answer_ids)
     ids.append(word_to_id["</ANSWER>"])
+    sections.append(2)
     ids.append(word_to_id["<EOS>"])
-    return ids
+    sections.append(2)
+    return ids, sections
 
 
 def encode_prompt(text: str, word_to_id: dict[str, int]) -> list[int]:
-    return [
-        word_to_id["<BOS>"], word_to_id["<USER>"],
-        *encode_text(text, word_to_id),
-        word_to_id["</USER>"], word_to_id["<THINK>"],
-    ]
+    return [word_to_id["<BOS>"], word_to_id["<USER>"], *encode_text(text, word_to_id), word_to_id["</USER>"], word_to_id["<THINK>"]]
 
 
-def build_dataset(
-    dataset_path: str | Path = DEFAULT_DATASET,
-    dictionary_path: str | Path = DEFAULT_DICTIONARY,
-    repeats: int = 1,
-    seed: int = 1234,
-):
+def build_dataset(dataset_path: str | Path = DEFAULT_DATASET, dictionary_path: str | Path = DEFAULT_DICTIONARY,
+                  repeats: int = 1, seed: int = 1234, return_sections: bool = False):
     records = load_records(dataset_path)
     word_to_id = create_dictionary_from_dataset(dataset_path, dictionary_path)
     rng = random.Random(seed)
     sequences = [encode_record(record, word_to_id) for record in records]
-    data = []
+    data, sections = [], []
     for _ in range(max(1, repeats)):
-        data.extend(rng.choice(sequences))
-    return data
+        seq, sec = rng.choice(sequences)
+        data.extend(seq)
+        sections.extend(sec)
+    return (data, sections) if return_sections else data
 
 
-def make_batch(data: list[int], batch_size: int, seq_len: int, device):
+def make_batch(data: list[int], batch_size: int, seq_len: int, device, sections: list[int] | None = None):
     if len(data) <= seq_len + 1:
         raise ValueError("Dataset is too small for the requested sequence length")
+    if sections is not None and len(sections) != len(data):
+        raise ValueError("sections must have the same length as data")
     starts = torch.randint(0, len(data) - seq_len - 1, (batch_size,))
     x = torch.stack([torch.tensor(data[i:i + seq_len], dtype=torch.long) for i in starts])
     y = torch.stack([torch.tensor(data[i + 1:i + seq_len + 1], dtype=torch.long) for i in starts])
-    return x.to(device), y.to(device)
+    if sections is None:
+        return x.to(device), y.to(device)
+    batch_sections = torch.stack([torch.tensor(sections[i + 1:i + seq_len + 1], dtype=torch.float32) for i in starts])
+    return x.to(device), y.to(device), batch_sections.to(device)
 
 
 def decode_ids(ids: list[int], id_to_word: dict[int, str]) -> str:
