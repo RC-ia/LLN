@@ -5,68 +5,86 @@ Experimento de IA que trabalha com **IDs numéricos** e usa um dicionário exter
 A rede não recebe strings durante o treinamento. O fluxo é:
 
 ```text
-texto → dicionário → números → rede → números → dicionário → texto
+texto → criador de IDs → números → rede → números → dicionário → texto
 ```
 
 ## Objetivo
 
 Testar quão rapidamente uma rede relativamente grande consegue aprender uma linguagem simples quando o alvo da rede é uma sequência de números.
 
-O primeiro protótipo usa um Transformer causal em PyTorch. O vocabulário fica em `data/dictionary.json` e não faz parte da arquitetura da rede.
+O dicionário **não é fixo no código**. Ele é criado automaticamente a partir do dataset antes do treinamento e salvo como JSON para que a mesma numeração possa ser usada na inferência.
 
 ## Estrutura
 
 ```text
 LLN/
 ├── data/
+│   ├── dataset.txt
 │   └── dictionary.json
 ├── lln/
 │   ├── __init__.py
 │   ├── model.py
 │   └── data.py
+├── create_ids.py
 ├── infer.py
 ├── train.py
 ├── requirements.txt
 └── README.md
 ```
 
-## Instalação
+## Criar IDs a partir de um dataset
 
-```bash
-pip install -r requirements.txt
+O dataset é um arquivo UTF-8 com uma frase por linha:
+
+```text
+casa grande
+casa pequena
+o gato corre
 ```
 
-## Criar um modelo
+Execute:
+
+```bash
+python create_ids.py data/dataset.txt --output data/dictionary.json
+```
+
+O programa encontra as palavras automaticamente, reserva IDs para `<PAD>`, `<BOS>`, `<EOS>` e `<UNK>` e cria o restante dos IDs a partir do corpus.
+
+## Treinar
+
+O `train.py` também cria/atualiza automaticamente o dicionário antes do treino:
+
+```bash
+python train.py --dataset data/dataset.txt --steps 2000 --seq-len 32 --batch-size 32
+```
+
+A rede recebe somente os IDs inteiros. O texto é usado apenas na preparação do dataset.
+
+## Criar um modelo maior
 
 O tamanho é controlado por `--dim`, `--layers` e `--heads`.
 
-Exemplos aproximados em FP32, sem contar pequenos estados/metadados:
+Exemplo:
 
 ```bash
 python train.py --dim 1024 --layers 12 --heads 16
 ```
 
-≈ 0,8–1,0 GB dependendo do vocabulário e configuração.
+Ou o modelo pequeno usado no primeiro experimento:
 
 ```bash
-python train.py --dim 512 --layers 8 --heads 8
+python train.py --dim 512 --layers 8 --heads 8 --steps 2000
 ```
-
-≈ 100–200 MB.
-
-Para uma GPU com pouca VRAM, use `--dtype float16` ou `--dtype bfloat16` quando o hardware suportar.
-
-## Treinamento rápido
-
-```bash
-python train.py --steps 2000 --seq-len 32 --batch-size 32
-```
-
-Por padrão o treino usa frases sintéticas construídas a partir do dicionário. O objetivo inicial não é criar uma IA de uso geral, mas medir a velocidade de aprendizado de relações numéricas simples.
 
 ## CPU ou GPU
 
-O código detecta CUDA automaticamente, mas também pode ser forçado:
+O código detecta CUDA automaticamente:
+
+```bash
+python train.py --device auto
+```
+
+Ou force:
 
 ```bash
 python train.py --device cpu
@@ -75,18 +93,14 @@ python train.py --device cuda
 
 ## Inferência
 
+Depois do treinamento:
+
 ```bash
-python infer.py --prompt "eu gosto de gato"
+python infer.py --model lln_model.pt --prompt "eu gosto de"
 ```
 
-A entrada é convertida para IDs usando o dicionário. A saída do modelo volta para IDs e depois para palavras.
+A entrada é convertida para IDs usando o dicionário salvo, a rede produz IDs e o programa converte os IDs de volta para palavras.
 
-## Experimentos recomendados
+## Experimento
 
-1. Treinar uma rede pequena até memorizar as frases.
-2. Medir `steps/s`, `tokens/s` e perda.
-3. Aumentar o tamanho para 100 MB, 250 MB, 500 MB e ~1 GB.
-4. Comparar CPU e GPU.
-5. Depois remover embeddings semânticos e testar codificações puramente escalares/numéricas.
-
-Esse projeto é deliberadamente simples: primeiro vamos medir o comportamento real antes de complicar a arquitetura.
+A próxima etapa é aumentar o corpus e verificar se a rede consegue generalizar para sequências que não aparecem literalmente no treinamento. Isso separa memorização de aprendizado das relações entre os IDs.
