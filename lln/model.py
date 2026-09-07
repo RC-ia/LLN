@@ -20,12 +20,7 @@ class CausalSelfAttention(nn.Module):
         q = q.view(b, t, self.heads, self.head_dim).transpose(1, 2)
         k = k.view(b, t, self.heads, self.head_dim).transpose(1, 2)
         v = v.view(b, t, self.heads, self.head_dim).transpose(1, 2)
-        y = torch.nn.functional.scaled_dot_product_attention(
-            q, k, v,
-            attn_mask=None,
-            dropout_p=self.dropout if self.training else 0.0,
-            is_causal=True,
-        )
+        y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0.0, is_causal=True)
         y = y.transpose(1, 2).contiguous().view(b, t, c)
         return self.out(y)
 
@@ -58,37 +53,21 @@ class Block(nn.Module):
 
 
 class LLN(nn.Module):
-    """Numeric-token language model.
+    """Numeric-token language model with explicit section boundaries."""
 
-    The external dictionary owns the mapping word <-> integer ID. The network
-    only receives integer IDs and predicts integer IDs. Embeddings are learned
-    internally, while no textual vocabulary logic lives in the model.
-    """
-
-    def __init__(
-        self,
-        vocab_size: int,
-        dim: int = 512,
-        layers: int = 8,
-        heads: int = 8,
-        max_seq_len: int = 256,
-        dropout: float = 0.0,
-    ):
+    def __init__(self, vocab_size: int, dim: int = 512, layers: int = 8, heads: int = 8,
+                 max_seq_len: int = 256, dropout: float = 0.0):
         super().__init__()
         self.vocab_size = vocab_size
         self.dim = dim
         self.layers = layers
         self.heads = heads
         self.max_seq_len = max_seq_len
-
         self.token = nn.Embedding(vocab_size, dim)
         self.position = nn.Embedding(max_seq_len, dim)
-        self.blocks = nn.ModuleList([
-            Block(dim, heads, dropout) for _ in range(layers)
-        ])
+        self.blocks = nn.ModuleList([Block(dim, heads, dropout) for _ in range(layers)])
         self.norm = nn.LayerNorm(dim)
         self.lm_head = nn.Linear(dim, vocab_size, bias=False)
-
         self.apply(self._init_weights)
 
     def _init_weights(self, module: nn.Module) -> None:
@@ -99,12 +78,8 @@ class LLN(nn.Module):
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        targets: torch.Tensor | None = None,
-        loss_weights: torch.Tensor | None = None,
-    ):
+    def forward(self, input_ids: torch.Tensor, targets: torch.Tensor | None = None,
+                loss_weights: torch.Tensor | None = None):
         _, t = input_ids.shape
         if t > self.max_seq_len:
             raise ValueError(f"sequence length {t} > max_seq_len {self.max_seq_len}")
@@ -116,47 +91,35 @@ class LLN(nn.Module):
 
         loss = None
         if targets is not None:
-            flat_logits = logits.reshape(-1, self.vocab_size)
-            flat_targets = targets.reshape(-1)
             token_loss = nn.functional.cross_entropy(
-                flat_logits,
-                flat_targets,
-                reduction="none",
+                logits.reshape(-1, self.vocab_size), targets.reshape(-1), reduction="none"
             )
             if loss_weights is None:
                 loss = token_loss.mean()
             else:
-                flat_weights = loss_weights.reshape(-1).to(token_loss.dtype)
-                weight_sum = flat_weights.sum()
-                if weight_sum.item() <= 0.0:
-                    raise ValueError("loss_weights must contain at least one positive weight")
-                loss = (token_loss * flat_weights).sum() / weight_sum
+                weights = loss_weights.reshape(-1).to(token_loss.dtype)
+                denom = weights.sum().clamp_min(1e-8)
+                loss = (token_loss * weights).sum() / denom
         return logits, loss
 
     @torch.no_grad()
-    def generate(
-        self,
-        input_ids: torch.Tensor,
-        max_new_tokens: int = 20,
-        temperature: float = 1.0,
-    ):
+    def generate(self, input_ids: torch.Tensor, max_new_tokens: int = 20,
+                 temperature: float = 1.0, stop_ids: set[int] | None = None):
         self.eval()
         if temperature <= 0.0:
             raise ValueError("temperature must be > 0")
-
+        stop_ids = stop_ids or {2}
         for _ in range(max_new_tokens):
             x = input_ids[:, -self.max_seq_len:]
             logits, _ = self(x)
             next_logits = logits[:, -1, :]
-
             if temperature == 1.0:
                 next_id = torch.argmax(next_logits, dim=-1, keepdim=True)
             else:
                 probabilities = torch.softmax(next_logits / temperature, dim=-1)
                 next_id = torch.multinomial(probabilities, num_samples=1)
-
             input_ids = torch.cat([input_ids, next_id], dim=1)
-            if (next_id == 2).all():
+            if any((next_id == token_id).all() for token_id in stop_ids):
                 break
         return input_ids
 
