@@ -6,7 +6,7 @@ from pathlib import Path
 
 import torch
 
-from lln.data import build_dataset, load_dictionary
+from lln.data import build_dataset, load_dictionary, make_batch
 from lln.model import LLN, parameter_count, parameter_size_mb
 
 
@@ -96,7 +96,7 @@ def main():
     parser.add_argument("--think-weight", type=float, default=0.25)
     parser.add_argument("--answer-weight", type=float, default=1.0)
     parser.add_argument("--recurrent-steps", type=int, default=2, help="Times the same transformer blocks are reused")
-    parser.add_argument("--output-clusters", type=int, default=128, help="Factorized softmax cluster count")
+    parser.add_argument("--output-clusters", type=int, default=120, help="Factorized softmax cluster count")
     parser.add_argument("--memory-slots", type=int, default=4, help="Latent scratchpad slots")
     parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument("--save", default="lln_model.pt")
@@ -257,7 +257,6 @@ def main():
         batch_indices = order[cursor:cursor + args.batch_size]
         cursor += args.batch_size
 
-        from lln.data import make_batch
         x, y, batch_sections = make_batch(data, args.batch_size, args.seq_len, device, indices=batch_indices)
         loss_weights = sections_to_weights(batch_sections, args.think_weight, args.answer_weight)
         optimizer.zero_grad(set_to_none=True)
