@@ -8,12 +8,6 @@ from lln.data import build_dataset, load_dictionary, make_batch
 from lln.model import LLN, parameter_count, parameter_size_mb
 
 
-# Dataset special-token IDs are fixed by lln.data.SPECIAL_TOKENS:
-# <PAD>=0, <BOS>=1, <EOS>=2, <UNK>=3, <USER>=4, <THINK>=5, <ANSWER>=6.
-THINK_TOKEN_ID = 5
-ANSWER_TOKEN_ID = 6
-
-
 def pick_dtype(name: str, device: torch.device):
     if name == "float32":
         return torch.float32
@@ -26,37 +20,19 @@ def pick_dtype(name: str, device: torch.device):
     raise ValueError(name)
 
 
-def make_loss_weights(targets: torch.Tensor, think_weight: float, answer_weight: float) -> torch.Tensor:
-    """Build per-token loss weights from the target token stream.
-
-    User prompt tokens receive weight 0. Thinking receives a smaller weight,
-    while the final answer receives the strongest weight. EOS is treated as
-    part of the answer so the model also learns when to stop.
-    """
+def sections_to_weights(sections: torch.Tensor, think_weight: float, answer_weight: float) -> torch.Tensor:
+    """Convert persistent section IDs into per-target loss weights."""
     if think_weight < 0.0 or answer_weight <= 0.0:
         raise ValueError("think_weight must be >= 0 and answer_weight must be > 0")
-
-    weights = torch.zeros_like(targets, dtype=torch.float32)
-    state = torch.zeros(targets.shape[0], dtype=torch.int8, device=targets.device)
-    # 0 = prompt/unscored, 1 = thinking, 2 = answer.
-
-    for pos in range(targets.shape[1]):
-        token = targets[:, pos]
-        think_mask = token.eq(THINK_TOKEN_ID)
-        answer_mask = token.eq(ANSWER_TOKEN_ID)
-        state = torch.where(think_mask, torch.ones_like(state), state)
-        state = torch.where(answer_mask, torch.full_like(state, 2), state)
-
-        weights[:, pos] = torch.where(
-            state.eq(1),
-            torch.full_like(weights[:, pos], think_weight),
-            torch.where(
-                state.eq(2),
-                torch.full_like(weights[:, pos], answer_weight),
-                torch.zeros_like(weights[:, pos]),
-            ),
-        )
-    return weights
+    return torch.where(
+        sections.eq(1),
+        torch.full_like(sections, think_weight, dtype=torch.float32),
+        torch.where(
+            sections.eq(2),
+            torch.full_like(sections, answer_weight, dtype=torch.float32),
+            torch.zeros_like(sections, dtype=torch.float32),
+        ),
+    )
 
 
 def main():
@@ -89,7 +65,12 @@ def main():
 
     dtype = pick_dtype(args.dtype, device)
 
-    data = build_dataset(args.dataset, args.dictionary, repeats=args.repeats)
+    data, sections = build_dataset(
+        args.dataset,
+        args.dictionary,
+        repeats=args.repeats,
+        return_sections=True,
+    )
     word_to_id, _ = load_dictionary(args.dictionary)
 
     model_cfg = {
@@ -145,8 +126,14 @@ def main():
 
     for local_step in range(1, args.steps + 1):
         global_step = start_step + local_step
-        x, y = make_batch(data, args.batch_size, args.seq_len, device)
-        loss_weights = make_loss_weights(y, args.think_weight, args.answer_weight)
+        x, y, batch_sections = make_batch(
+            data,
+            args.batch_size,
+            args.seq_len,
+            device,
+            sections=sections,
+        )
+        loss_weights = sections_to_weights(batch_sections, args.think_weight, args.answer_weight)
         optimizer.zero_grad(set_to_none=True)
 
         if scaler.is_enabled():
