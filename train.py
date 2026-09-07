@@ -8,7 +8,7 @@ from lln.data import build_dataset, load_dictionary, make_batch
 from lln.model import LLN, parameter_count, parameter_size_mb
 
 
-LOSS_SCHEME_VERSION = 3
+LOSS_SCHEME_VERSION = 4
 
 
 def pick_dtype(name: str, device: torch.device):
@@ -38,7 +38,7 @@ def sections_to_weights(sections: torch.Tensor, think_weight: float, answer_weig
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train LLN on bounded windows from complete structured examples")
+    parser = argparse.ArgumentParser(description="Train LLN on bounded complete examples")
     parser.add_argument("--dataset", default="data/dataset.json")
     parser.add_argument("--dictionary", default="data/dictionary.json")
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
@@ -46,8 +46,8 @@ def main():
     parser.add_argument("--dim", type=int, default=512)
     parser.add_argument("--layers", type=int, default=8)
     parser.add_argument("--heads", type=int, default=8)
-    parser.add_argument("--seq-len", type=int, default=256, help="Maximum context window per training example")
-    parser.add_argument("--batch-size", type=int, default=2, help="Examples per training batch")
+    parser.add_argument("--seq-len", type=int, default=256, help="Maximum context per training example")
+    parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--steps", type=int, default=2000, help="Additional steps to run")
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--think-weight", type=float, default=0.25)
@@ -77,6 +77,7 @@ def main():
         args.dictionary,
         repeats=args.repeats,
         seed=1234,
+        max_len=args.seq_len,
         return_sections=True,
     )
     word_to_id, _ = load_dictionary(args.dictionary)
@@ -126,9 +127,10 @@ def main():
     mb = parameter_size_mb(model, torch.tensor([], dtype=dtype).element_size())
     print(f"device={device} dtype={dtype}")
     print(f"parameters={n_params:,} model_weight_size={mb:.1f} MB")
-    print(f"vocab={len(word_to_id)} records={len(data):,} max_record_ids={max_record_len:,}")
+    print(f"vocab={len(word_to_id)} records={len(data):,} max_training_record_ids={max_record_len:,}")
     print(f"seq_len={args.seq_len} batch_size={args.batch_size}")
     print(f"loss_weights=prompt:0 think:{args.think_weight:g} answer:{args.answer_weight:g}")
+    print("long_record_policy=preserve_prompt_and_answer_truncate_think")
     print(f"resume={resumed} starting_step={start_step}")
 
     scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda" and dtype == torch.float16))
