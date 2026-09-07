@@ -149,8 +149,6 @@ def _compact_record(
 
     remaining = max_len - len(prompt_ids) - len(answer_ids)
     if remaining < 0:
-        # The prompt + answer alone is too long. Preserve the complete answer
-        # and trim only the oldest prompt tokens to fit the context window.
         prompt_ids = prompt_ids[max(0, -remaining):]
         prompt_sections = prompt_sections[-len(prompt_ids):] if prompt_ids else []
         remaining = max_len - len(prompt_ids) - len(answer_ids)
@@ -159,12 +157,8 @@ def _compact_record(
             answer_sections = answer_sections[:len(answer_ids)]
             return prompt_ids + answer_ids, prompt_sections + answer_sections
 
-    # sections and ids are parallel arrays; locate the THINK section directly
-    # in the section labels instead of searching the token IDs for a section index.
     think_open = next((i for i, s in enumerate(sections) if s == SECTION_THINK), None)
     if think_open is not None and remaining > 0:
-        # Take the beginning of the reasoning so it remains causally connected
-        # to the question, then keep the full final answer.
         think_content_start = think_open
         think_content_end = answer_start
         keep_think = ids[think_content_start:think_content_end][:remaining]
@@ -184,23 +178,37 @@ def build_dataset(
 ):
     records = load_records(dataset_path)
     word_to_id = create_dictionary_from_dataset(dataset_path, dictionary_path)
-    rng = random.Random(seed)
     sequences = [encode_record(record, word_to_id) for record in records]
 
     if max_len is not None:
         sequences = [_compact_record(ids, sec, max_len + 1) for ids, sec in sequences]
 
-    selected = [rng.choice(sequences) for _ in range(max(1, repeats))]
-    return selected
+    if repeats <= 0:
+        repeats = len(sequences)
+    repeated = []
+    for _ in range(max(1, repeats) // max(1, len(sequences))):
+        repeated.extend(sequences)
+    remainder = max(1, repeats) % max(1, len(sequences))
+    if remainder:
+        order = list(range(len(sequences)))
+        random.Random(seed + 1).shuffle(order)
+        repeated.extend(sequences[i] for i in order[:remainder])
+    return repeated
 
 
-def make_batch(data, batch_size: int, seq_len: int, device, sections=None):
+def make_batch(data, batch_size: int, seq_len: int, device, sections=None, indices=None):
     if not data:
         raise ValueError("Dataset contains no training examples")
     if sections is not None:
         raise ValueError("sections argument is no longer used; build_dataset returns complete records")
 
-    chosen = [random.choice(data) for _ in range(batch_size)]
+    if indices is None:
+        chosen = [random.choice(data) for _ in range(batch_size)]
+    else:
+        if len(indices) != batch_size:
+            raise ValueError("indices length must equal batch_size")
+        chosen = [data[i] for i in indices]
+
     x_rows, y_rows, w_rows = [], [], []
     pad_id = 0
 
