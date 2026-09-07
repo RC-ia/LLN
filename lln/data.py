@@ -122,29 +122,91 @@ def encode_prompt(text: str, word_to_id: dict[str, int]) -> list[int]:
     return [word_to_id["<BOS>"], word_to_id["<USER>"]] + encode_text(text, word_to_id) + [word_to_id["<THINK>"]]
 
 
+def _encode_record_with_sections(
+    record: tuple[str, str | None, str],
+    word_to_id: dict[str, int],
+) -> tuple[list[int], list[int]]:
+    """Return token IDs and a section ID for every token.
+
+    Section IDs: 0=prompt/unscored, 1=thinking, 2=final answer.
+    The answer section includes <ANSWER> and <EOS>.
+    """
+    user_text, reasoning, answer = record
+    ids = [word_to_id["<BOS>"], word_to_id["<USER>"]]
+    sections = [0, 0]
+
+    user_ids = encode_text(user_text, word_to_id)
+    ids += user_ids
+    sections += [0] * len(user_ids)
+
+    if reasoning:
+        ids.append(word_to_id["<THINK>"])
+        sections.append(1)
+        reasoning_ids = encode_text(reasoning, word_to_id)
+        ids += reasoning_ids
+        sections += [1] * len(reasoning_ids)
+
+    ids.append(word_to_id["<ANSWER>"])
+    sections.append(2)
+    answer_ids = encode_text(answer, word_to_id)
+    ids += answer_ids
+    sections += [2] * len(answer_ids)
+
+    ids.append(word_to_id["<EOS>"])
+    sections.append(2)
+    return ids, sections
+
+
 def build_dataset(
     dataset_path: str | Path = DEFAULT_DATASET,
     dictionary_path: str | Path = DEFAULT_DICTIONARY,
     repeats: int = 1,
     seed: int = 1234,
+    return_sections: bool = False,
 ):
     records = load_records(dataset_path)
     word_to_id = create_dictionary_from_dataset(dataset_path, dictionary_path)
     rng = random.Random(seed)
     sequences = [encode_record(record, word_to_id) for record in records]
+    section_sequences = None
+    if return_sections:
+        section_sequences = [_encode_record_with_sections(record, word_to_id)[1] for record in records]
+
     data = []
+    sections = []
     for _ in range(max(1, repeats)):
-        data.extend(list(rng.choice(sequences)))
+        index = rng.randrange(len(sequences))
+        data.extend(sequences[index])
+        if return_sections:
+            sections.extend(section_sequences[index])
+
+    if return_sections:
+        return data, sections
     return data
 
 
-def make_batch(data: list[int], batch_size: int, seq_len: int, device):
+def make_batch(
+    data: list[int],
+    batch_size: int,
+    seq_len: int,
+    device,
+    sections: list[int] | None = None,
+):
     if len(data) <= seq_len + 1:
         raise ValueError("Dataset is too small for the requested sequence length")
+    if sections is not None and len(sections) != len(data):
+        raise ValueError("sections must have the same length as data")
+
     starts = torch.randint(0, len(data) - seq_len - 1, (batch_size,))
     x = torch.stack([torch.tensor(data[i:i + seq_len], dtype=torch.long) for i in starts])
     y = torch.stack([torch.tensor(data[i + 1:i + seq_len + 1], dtype=torch.long) for i in starts])
-    return x.to(device), y.to(device)
+    if sections is None:
+        return x.to(device), y.to(device)
+
+    loss_sections = torch.stack([
+        torch.tensor(sections[i + 1:i + seq_len + 1], dtype=torch.long) for i in starts
+    ])
+    return x.to(device), y.to(device), loss_sections.to(device)
 
 
 def decode_ids(ids: list[int], id_to_word: dict[int, str]) -> str:
