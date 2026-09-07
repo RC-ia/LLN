@@ -1,4 +1,3 @@
-import math
 import torch
 from torch import nn
 
@@ -21,13 +20,11 @@ class CausalSelfAttention(nn.Module):
         k = k.view(b, t, self.heads, self.head_dim).transpose(1, 2)
         v = v.view(b, t, self.heads, self.head_dim).transpose(1, 2)
         y = torch.nn.functional.scaled_dot_product_attention(
-            q, k, v,
-            attn_mask=None,
+            q, k, v, attn_mask=None,
             dropout_p=self.dropout if self.training else 0.0,
             is_causal=True,
         )
-        y = y.transpose(1, 2).contiguous().view(b, t, c)
-        return self.out(y)
+        return self.out(y.transpose(1, 2).contiguous().view(b, t, c))
 
 
 class MLP(nn.Module):
@@ -46,8 +43,6 @@ class MLP(nn.Module):
 class Block(nn.Module):
     def __init__(self, dim: int, heads: int, dropout: float = 0.0):
         super().__init__()
-        if dim % 8 != 0:
-            raise ValueError("dim must be divisible by 8 for the reasoning state")
         self.norm1 = nn.LayerNorm(dim)
         self.attn = CausalSelfAttention(dim, heads, dropout)
         self.norm2 = nn.LayerNorm(dim)
@@ -55,16 +50,13 @@ class Block(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x + self.attn(self.norm1(x))
-        x = x + self.mlp(self.norm2(x))
-        return x
+        return x + self.mlp(self.norm2(x))
 
 
 class ReasoningState(nn.Module):
-    """Compact latent state extracted at <THINK> and carried forward."""
-
     def __init__(self, dim: int):
         super().__init__()
-        state_dim = dim // 8
+        state_dim = max(1, dim // 8)
         self.to_state = nn.Sequential(
             nn.LayerNorm(dim),
             nn.Linear(dim, state_dim, bias=False),
@@ -73,16 +65,20 @@ class ReasoningState(nn.Module):
         )
         self.gate = nn.Linear(dim, 1, bias=False)
 
-    def forward(self, think_hidden: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, think_hidden: torch.Tensor, x: torch.Tensor,
+                think_positions: torch.Tensor) -> torch.Tensor:
         state = self.to_state(think_hidden)
         gate = torch.sigmoid(self.gate(think_hidden))
-        return x + gate * state[:, None, :]
+        carry = gate * state
+        active = think_positions.cumsum(dim=1).clamp(max=1).to(x.dtype)
+        return x + active[:, :, None] * carry[:, None, :]
 
 
 class LLN(nn.Module):
     """Numeric-token language model with explicit structured sections."""
 
     ARCHITECTURE_VERSION = 2
+    THINK_TOKEN_ID = 6
 
     def __init__(self, vocab_size: int, dim: int = 512, layers: int = 8, heads: int = 8,
                  max_seq_len: int = 256, dropout: float = 0.0):
@@ -118,15 +114,14 @@ class LLN(nn.Module):
         for block in self.blocks:
             x = block(x)
 
-        # Extract a compact latent state specifically from <THINK>.
-        # The fixed token id 6 is <THINK> in the LLN dictionary.
-        think_id = 6
-        think_positions = input_ids.eq(think_id)
+        think_positions = input_ids.eq(self.THINK_TOKEN_ID)
         if think_positions.any():
-            batch_indices = torch.arange(x.size(0), device=x.device)
-            think_index = torch.argmax(think_positions.to(torch.int64), dim=1)
-            think_hidden = x[batch_indices, think_index]
-            x = self.reasoning_state(think_hidden, x)
+            has_think = think_positions.any(dim=1)
+            batch = torch.arange(x.size(0), device=x.device)
+            think_index = think_positions.to(torch.int64).argmax(dim=1)
+            think_hidden = x[batch, think_index]
+            think_hidden = torch.where(has_think[:, None], think_hidden, torch.zeros_like(think_hidden))
+            x = self.reasoning_state(think_hidden, x, think_positions)
 
         logits = self.lm_head(self.norm(x))
         loss = None
@@ -161,17 +156,12 @@ class LLN(nn.Module):
             x = input_ids[:, -self.max_seq_len:]
             logits, _ = self(x)
             next_logits = logits[:, -1, :].clone()
-
             if repetition_penalty > 1.0:
                 for batch_idx in range(input_ids.size(0)):
                     seen = set(int(token) for token in input_ids[batch_idx].tolist())
                     for token_id in seen:
                         value = next_logits[batch_idx, token_id]
-                        if value < 0:
-                            next_logits[batch_idx, token_id] *= repetition_penalty
-                        else:
-                            next_logits[batch_idx, token_id] /= repetition_penalty
-
+                        next_logits[batch_idx, token_id] = value * repetition_penalty if value < 0 else value / repetition_penalty
             if no_repeat_ngram_size >= 2 and input_ids.size(1) >= no_repeat_ngram_size - 1:
                 for batch_idx in range(input_ids.size(0)):
                     tokens = input_ids[batch_idx].tolist()
@@ -183,13 +173,11 @@ class LLN(nn.Module):
                             banned.add(ngram[-1])
                     if banned:
                         next_logits[batch_idx, list(banned)] = float("-inf")
-
             if temperature == 1.0:
                 next_id = torch.argmax(next_logits, dim=-1, keepdim=True)
             else:
                 probabilities = torch.softmax(next_logits / temperature, dim=-1)
                 next_id = torch.multinomial(probabilities, num_samples=1)
-
             input_ids = torch.cat([input_ids, next_id], dim=1)
             if all(int(next_id[i, 0]) in stop_ids for i in range(next_id.size(0))):
                 break
