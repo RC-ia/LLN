@@ -315,7 +315,7 @@ class LLN(nn.Module):
         logits = self.lm_head.full_logits(x)
         loss = None
         if targets is not None:
-            loss = self.lm_head.loss(x, targets, loss_weights=loss_weights)
+            loss = self.lm_head.loss(x, targets, weights=loss_weights)
         return logits, loss
 
     @torch.no_grad()
