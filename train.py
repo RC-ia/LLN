@@ -8,6 +8,9 @@ from lln.data import build_dataset, load_dictionary, make_batch
 from lln.model import LLN, parameter_count, parameter_size_mb
 
 
+LOSS_SCHEME_VERSION = 1
+
+
 def pick_dtype(name: str, device: torch.device):
     if name == "float32":
         return torch.float32
@@ -95,6 +98,12 @@ def main():
         if comparable != model_cfg:
             print("checkpoint architecture/vocabulary differs from current dataset/config; starting a new model")
             checkpoint = None
+        elif saved_cfg.get("loss_scheme_version") != LOSS_SCHEME_VERSION:
+            print("checkpoint uses an older loss objective; starting a new model")
+            checkpoint = None
+        elif saved_cfg.get("think_weight") != args.think_weight or saved_cfg.get("answer_weight") != args.answer_weight:
+            print("checkpoint loss weights differ from current config; starting a new model")
+            checkpoint = None
         else:
             resumed = True
             start_step = int(checkpoint.get("step", 0))
@@ -167,6 +176,7 @@ def main():
             **model_cfg,
             "dictionary": str(args.dictionary),
             "dataset": str(args.dataset),
+            "loss_scheme_version": LOSS_SCHEME_VERSION,
             "think_weight": args.think_weight,
             "answer_weight": args.answer_weight,
         },
