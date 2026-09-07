@@ -5,6 +5,15 @@ from lln.data import load_dictionary, encode_prompt, decode_ids
 from lln.model import LLN
 
 
+def checkpoint_dtype(checkpoint) -> torch.dtype:
+    dtype_name = checkpoint.get("config", {}).get("dtype", "torch.float32")
+    if dtype_name in {"torch.float16", "float16"}:
+        return torch.float16
+    if dtype_name in {"torch.bfloat16", "bfloat16"}:
+        return torch.bfloat16
+    return torch.float32
+
+
 def main():
     parser = argparse.ArgumentParser(description="Generate text from an LLN checkpoint")
     parser.add_argument("--model", default="lln_model.pt")
@@ -34,17 +43,12 @@ def main():
     checkpoint = torch.load(args.model, map_location=device, weights_only=True)
     cfg = checkpoint["config"].copy()
 
-    # Only model constructor arguments belong in LLN(**cfg). Everything else
-    # stored in the checkpoint is training/runtime metadata.
     model_keys = {"vocab_size", "dim", "layers", "heads", "max_seq_len", "dropout"}
     cfg = {key: value for key, value in cfg.items() if key in model_keys}
 
-    model = LLN(**cfg)
+    model_dtype = checkpoint_dtype(checkpoint)
+    model = LLN(**cfg).to(device=device, dtype=model_dtype)
     model.load_state_dict(checkpoint["model"])
-
-    # Preserve the precision used by the saved weights.
-    model_dtype = next(model.parameters()).dtype
-    model = model.to(device=device, dtype=model_dtype)
     model.eval()
 
     ids = torch.tensor(
