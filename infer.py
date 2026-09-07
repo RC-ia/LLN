@@ -33,19 +33,18 @@ def main():
     word_to_id, id_to_word = load_dictionary("data/dictionary.json")
     checkpoint = torch.load(args.model, map_location=device, weights_only=True)
     cfg = checkpoint["config"].copy()
-    for key in ("dictionary", "dataset", "loss_scheme_version", "think_weight", "answer_weight", "dtype"):
-        cfg.pop(key, None)
+
+    # Only model constructor arguments belong in LLN(**cfg). Everything else
+    # stored in the checkpoint is training/runtime metadata.
+    model_keys = {"vocab_size", "dim", "layers", "heads", "max_seq_len", "dropout"}
+    cfg = {key: value for key, value in cfg.items() if key in model_keys}
 
     model = LLN(**cfg)
     model.load_state_dict(checkpoint["model"])
 
-    # Preserve the checkpoint precision for inference. Older checkpoints without
-    # an explicit dtype are treated as FP32.
+    # Preserve the precision used by the saved weights.
     model_dtype = next(model.parameters()).dtype
-    if device.type == "cuda":
-        model = model.to(device=device, dtype=model_dtype)
-    else:
-        model = model.to(device=device, dtype=model_dtype)
+    model = model.to(device=device, dtype=model_dtype)
     model.eval()
 
     ids = torch.tensor(
