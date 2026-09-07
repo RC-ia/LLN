@@ -117,12 +117,27 @@ class LLN(nn.Module):
         return logits, loss
 
     @torch.no_grad()
-    def generate(self, input_ids: torch.Tensor, max_new_tokens: int = 20):
+    def generate(
+        self,
+        input_ids: torch.Tensor,
+        max_new_tokens: int = 20,
+        temperature: float = 1.0,
+    ):
         self.eval()
+        if temperature <= 0.0:
+            raise ValueError("temperature must be > 0")
+
         for _ in range(max_new_tokens):
             x = input_ids[:, -self.max_seq_len:]
             logits, _ = self(x)
-            next_id = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
+            next_logits = logits[:, -1, :]
+
+            if temperature == 1.0:
+                next_id = torch.argmax(next_logits, dim=-1, keepdim=True)
+            else:
+                probabilities = torch.softmax(next_logits / temperature, dim=-1)
+                next_id = torch.multinomial(probabilities, num_samples=1)
+
             input_ids = torch.cat([input_ids, next_id], dim=1)
             if (next_id == 2).all():
                 break
