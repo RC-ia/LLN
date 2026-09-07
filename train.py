@@ -22,6 +22,8 @@ def pick_dtype(name: str, device: torch.device):
 
 def main():
     parser = argparse.ArgumentParser(description="Train LLN on integer token IDs")
+    parser.add_argument("--dataset", default="data/dataset.txt")
+    parser.add_argument("--dictionary", default="data/dictionary.json")
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
     parser.add_argument("--dtype", default="float32", choices=["float32", "float16", "bfloat16"])
     parser.add_argument("--dim", type=int, default=512)
@@ -44,8 +46,10 @@ def main():
             raise RuntimeError("CUDA requested but CUDA is not available")
 
     dtype = pick_dtype(args.dtype, device)
-    word_to_id, id_to_word = load_dictionary("data/dictionary.json")
-    data = build_dataset(word_to_id, repeats=args.repeats)
+
+    # The dictionary is generated from the dataset before encoding anything.
+    data = build_dataset(args.dataset, args.dictionary, repeats=args.repeats)
+    word_to_id, _ = load_dictionary(args.dictionary)
 
     model = LLN(
         vocab_size=len(word_to_id),
@@ -93,7 +97,8 @@ def main():
         if step == 1 or step % args.log_every == 0 or step == args.steps:
             now = time.perf_counter()
             elapsed = max(now - last_log, 1e-9)
-            tokens_s = (args.batch_size * args.seq_len * args.log_every) / elapsed if step > args.log_every else total_tokens / max(now - start, 1e-9)
+            window_steps = args.log_every if step > args.log_every else step
+            tokens_s = (args.batch_size * args.seq_len * window_steps) / elapsed
             print(f"step={step:6d} loss={loss.item():.6f} tok/s={tokens_s:,.0f}")
             last_log = now
 
@@ -106,7 +111,7 @@ def main():
             "layers": args.layers,
             "heads": args.heads,
             "max_seq_len": max(args.seq_len, 256),
-            "dictionary": "data/dictionary.json",
+            "dictionary": str(args.dictionary),
         },
     }, save_path)
     print(f"saved={save_path}")
