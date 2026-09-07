@@ -42,7 +42,7 @@ def main():
     parser.add_argument("--dataset", default="data/dataset.json")
     parser.add_argument("--dictionary", default="data/dictionary.json")
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
-    parser.add_argument("--dtype", default="float32", choices=["float32", "float16", "bfloat16"])
+    parser.add_argument("--dtype", default="float16", choices=["float32", "float16", "bfloat16"])
     parser.add_argument("--dim", type=int, default=512)
     parser.add_argument("--layers", type=int, default=8)
     parser.add_argument("--heads", type=int, default=8)
