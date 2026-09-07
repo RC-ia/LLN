@@ -113,7 +113,6 @@ class LatentReasoningMemory(nn.Module):
         self.state_in = nn.Linear(dim, state_dim, bias=False)
         self.state_out = nn.Linear(state_dim, dim, bias=False)
         self.state_gate = nn.Linear(dim, 1, bias=False)
-
         self.write_gate = nn.Linear(dim, slots, bias=False)
         self.write_value = nn.Linear(dim, dim, bias=False)
         self.query = nn.Linear(dim, dim, bias=False)
@@ -162,9 +161,9 @@ class LatentReasoningMemory(nn.Module):
 
 
 class FactorizedLMHead(nn.Module):
-    """Predict token as cluster + local index, preserving the fixed integer dictionary."""
+    """Predict token as cluster + local index, preserving fixed integer token IDs."""
 
-    def __init__(self, dim: int, vocab_size: int, clusters: int = 128):
+    def __init__(self, dim: int, vocab_size: int, clusters: int = 120):
         super().__init__()
         self.vocab_size = vocab_size
         self.clusters = max(1, min(clusters, vocab_size))
@@ -183,7 +182,21 @@ class FactorizedLMHead(nn.Module):
 
     def full_logits(self, x: torch.Tensor) -> torch.Tensor:
         cluster, local = self.factorized_logits(x)
-        return cluster.unsqueeze(-1) + local.unsqueeze(-2)
+        combined = cluster.unsqueeze(-1) + local.unsqueeze(-2)
+        return combined.reshape(*combined.shape[:-2], -1)[..., :self.vocab_size]
+
+    def _local_log_z_per_cluster(self, local: torch.Tensor) -> torch.Tensor:
+        if self.clusters * self.cluster_size == self.vocab_size:
+            z = torch.logsumexp(local.float(), dim=-1)
+            return z.unsqueeze(-1).expand(*z.shape, self.clusters)
+        full_clusters = self.vocab_size // self.cluster_size
+        remainder = self.vocab_size - full_clusters * self.cluster_size
+        full_z = torch.logsumexp(local.float(), dim=-1)
+        parts = [full_z.unsqueeze(-1).expand(*full_z.shape, full_clusters)]
+        if remainder:
+            tail_z = torch.logsumexp(local[..., :remainder].float(), dim=-1)
+            parts.append(tail_z.unsqueeze(-1))
+        return torch.cat(parts, dim=-1)
 
     def loss(self, x: torch.Tensor, targets: torch.Tensor, weights: torch.Tensor | None = None) -> torch.Tensor:
         cluster, local = self.factorized_logits(x)
@@ -192,10 +205,9 @@ class FactorizedLMHead(nn.Module):
         target_logits = cluster.gather(-1, target_cluster.unsqueeze(-1)).squeeze(-1)
         target_logits = target_logits + local.gather(-1, target_local.unsqueeze(-1)).squeeze(-1)
 
-        # Because token logits are cluster_logit + local_logit, the partition function factorizes.
-        log_z = torch.logsumexp(cluster.float(), dim=-1) + torch.logsumexp(local.float(), dim=-1)
-        token_loss = log_z - target_logits.float()
-        token_loss = token_loss.clamp_min(0.0)
+        local_log_z = self._local_log_z_per_cluster(local)
+        log_z = torch.logsumexp(cluster.float() + local_log_z, dim=-1)
+        token_loss = (log_z - target_logits.float()).clamp_min(0.0)
         if weights is None:
             return token_loss.mean()
         flat_weights = weights.reshape(-1).to(token_loss.dtype)
@@ -222,7 +234,7 @@ class LLN(nn.Module):
         max_seq_len: int = 256,
         dropout: float = 0.0,
         recurrent_steps: int = 2,
-        output_clusters: int = 128,
+        output_clusters: int = 120,
         memory_slots: int = 4,
         type_count: int = 6,
     ):
@@ -297,11 +309,7 @@ class LLN(nn.Module):
         for _ in range(self.recurrent_steps):
             for block in self.blocks:
                 x = block(x, token_types)
-            x = self.latent_memory(
-                x, input_ids,
-                self.THINK_TOKEN_ID,
-                self.THINK_END_TOKEN_ID,
-            )
+            x = self.latent_memory(x, input_ids, self.THINK_TOKEN_ID, self.THINK_END_TOKEN_ID)
 
         x = self.norm(x)
         logits = self.lm_head.full_logits(x)
