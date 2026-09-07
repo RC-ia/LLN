@@ -1,15 +1,15 @@
 import argparse
 import torch
 
-from lln.data import load_dictionary, encode_sentence, decode_ids
+from lln.data import load_dictionary, encode_prompt, decode_ids
 from lln.model import LLN
 
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="Generate text from an LLN checkpoint")
     parser.add_argument("--model", default="lln_model.pt")
     parser.add_argument("--prompt", default="eu gosto de")
-    parser.add_argument("--new-tokens", type=int, default=12)
+    parser.add_argument("--new-tokens", type=int, default=128)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
     args = parser.parse_args()
@@ -27,14 +27,18 @@ def main():
     word_to_id, id_to_word = load_dictionary("data/dictionary.json")
     checkpoint = torch.load(args.model, map_location=device, weights_only=True)
     cfg = checkpoint["config"].copy()
-    for key in ("dictionary", "dataset", "repeats"):
+    for key in ("dictionary", "dataset"):
         cfg.pop(key, None)
 
     model = LLN(**cfg).to(device)
     model.load_state_dict(checkpoint["model"])
     model.eval()
 
-    ids = torch.tensor([encode_sentence(args.prompt, word_to_id)[:-1]], dtype=torch.long, device=device)
+    ids = torch.tensor(
+        [encode_prompt(args.prompt, word_to_id)],
+        dtype=torch.long,
+        device=device,
+    )
     out = model.generate(
         ids,
         max_new_tokens=args.new_tokens,
