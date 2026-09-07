@@ -6,7 +6,7 @@ from pathlib import Path
 
 import torch
 
-from lln.data import build_dataset, load_dictionary, make_batch
+from lln.data import build_dataset, load_dictionary
 from lln.model import LLN, parameter_count, parameter_size_mb
 
 
@@ -95,6 +95,9 @@ def main():
     parser.add_argument("--warmup-steps", type=int, default=100)
     parser.add_argument("--think-weight", type=float, default=0.25)
     parser.add_argument("--answer-weight", type=float, default=1.0)
+    parser.add_argument("--recurrent-steps", type=int, default=2, help="Times the same transformer blocks are reused")
+    parser.add_argument("--output-clusters", type=int, default=128, help="Factorized softmax cluster count")
+    parser.add_argument("--memory-slots", type=int, default=4, help="Latent scratchpad slots")
     parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument("--save", default="lln_model.pt")
     parser.add_argument("--repeats", type=int, default=2000, help="Examples per prepared epoch; defaults to one full dataset pass")
@@ -110,6 +113,12 @@ def main():
         raise ValueError("--warmup-steps must be >= 0")
     if args.min_lr <= 0.0 or args.min_lr > args.lr:
         raise ValueError("--min-lr must be > 0 and <= --lr")
+    if args.recurrent_steps < 1:
+        raise ValueError("--recurrent-steps must be >= 1")
+    if args.output_clusters < 1:
+        raise ValueError("--output-clusters must be >= 1")
+    if args.memory_slots < 1:
+        raise ValueError("--memory-slots must be >= 1")
 
     if args.device == "auto":
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -130,7 +139,7 @@ def main():
         max_len=args.seq_len,
         return_sections=True,
     )
-    word_to_id, _ = load_dictionary(args.dictionary)
+    word_to_id, _, token_types, dictionary_meta = load_dictionary(args.dictionary, with_metadata=True)
 
     model_cfg = {
         "vocab_size": len(word_to_id),
@@ -138,6 +147,10 @@ def main():
         "layers": args.layers,
         "heads": args.heads,
         "max_seq_len": args.seq_len,
+        "recurrent_steps": args.recurrent_steps,
+        "output_clusters": args.output_clusters,
+        "memory_slots": args.memory_slots,
+        "type_count": int(dictionary_meta.get("type_count", 6)),
     }
 
     save_path = Path(args.save)
@@ -173,6 +186,7 @@ def main():
             checkpoint_cursor = int(checkpoint.get("epoch_cursor", 0))
 
     model = LLN(**model_cfg).to(device=device, dtype=dtype)
+    model.set_token_types(token_types)
     if checkpoint is not None:
         model.load_state_dict(checkpoint["model"])
 
@@ -199,8 +213,10 @@ def main():
     print(f"device={device} dtype={dtype}")
     print(f"parameters={n_params:,} model_weight_size={mb:.1f} MB")
     print(f"master_weight_size={master_mb:.1f} MB")
-    print(f"vocab={len(word_to_id)} records={len(data):,}")
+    print(f"vocab={len(word_to_id):,} records={len(data):,}")
     print(f"seq_len={args.seq_len} batch_size={args.batch_size}")
+    print(f"recurrent_steps={args.recurrent_steps} output_clusters={args.output_clusters} cluster_size={model.lm_head.cluster_size} memory_slots={args.memory_slots}")
+    print(f"token_types={model_cfg['type_count']} dictionary_metadata={dictionary_meta.get('version', 1)}")
     print(f"loss_weights=prompt:0 think:{args.think_weight:g} answer:{args.answer_weight:g}")
     print("long_record_policy=preserve_prompt_and_answer_truncate_think")
     print("optimizer=AdamW fp32_master_params")
@@ -241,6 +257,7 @@ def main():
         batch_indices = order[cursor:cursor + args.batch_size]
         cursor += args.batch_size
 
+        from lln.data import make_batch
         x, y, batch_sections = make_batch(data, args.batch_size, args.seq_len, device, indices=batch_indices)
         loss_weights = sections_to_weights(batch_sections, args.think_weight, args.answer_weight)
         optimizer.zero_grad(set_to_none=True)
