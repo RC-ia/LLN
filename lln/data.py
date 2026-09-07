@@ -17,11 +17,65 @@ SECTION_PROMPT = 0
 SECTION_THINK = 1
 SECTION_ANSWER = 2
 
+TYPE_SPECIAL = 0
+TYPE_WORD = 1
+TYPE_NUMBER = 2
+TYPE_PUNCT = 3
+TYPE_OPERATOR = 4
+TYPE_CODE = 5
+TYPE_NAMES = {
+    TYPE_SPECIAL: "special",
+    TYPE_WORD: "word",
+    TYPE_NUMBER: "number",
+    TYPE_PUNCT: "punct",
+    TYPE_OPERATOR: "operator",
+    TYPE_CODE: "code",
+}
+
 
 def normalize_text(text: str) -> str:
     text = str(text).lower().strip()
     text = re.sub(r"\s+", " ", text)
     return text
+
+
+def classify_token(token: str) -> int:
+    """Assign a compact semantic/syntactic type without changing the fixed token ID."""
+    if token in SPECIAL_TOKENS or (token.startswith("<") and token.endswith(">")):
+        return TYPE_SPECIAL
+    if re.fullmatch(r"[+-]?(?:\d+(?:[.,]\d*)?|[.,]\d+)", token):
+        return TYPE_NUMBER
+    if re.fullmatch(r"[+\-*/%=<>^~|&]+", token):
+        return TYPE_OPERATOR
+    if re.fullmatch(r"[^\w\s]+", token):
+        return TYPE_PUNCT
+    if any(ch in token for ch in "{}[]();:=\\/\"'`#$") or token.endswith((".py", ".js", ".ts", ".json")):
+        return TYPE_CODE
+    return TYPE_WORD
+
+
+def build_dictionary_metadata(word_to_id: dict[str, int]) -> dict:
+    token_types = [TYPE_SPECIAL] * len(word_to_id)
+    for token, idx in word_to_id.items():
+        token_types[int(idx)] = classify_token(token)
+    return {
+        "version": 1,
+        "type_count": len(TYPE_NAMES),
+        "type_names": {str(k): v for k, v in TYPE_NAMES.items()},
+        "token_types": token_types,
+    }
+
+
+def metadata_path(dictionary_path: str | Path) -> Path:
+    dictionary_path = Path(dictionary_path)
+    return dictionary_path.with_suffix(".meta.json")
+
+
+def save_dictionary_metadata(dictionary_path: str | Path, word_to_id: dict[str, int]) -> dict:
+    metadata = build_dictionary_metadata(word_to_id)
+    path = metadata_path(dictionary_path)
+    path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return metadata
 
 
 def load_records(dataset_path: str | Path) -> list[tuple[str, str | None, str]]:
@@ -74,14 +128,28 @@ def create_dictionary_from_dataset(dataset_path: str | Path, dictionary_path: st
     dictionary_path = Path(dictionary_path)
     dictionary_path.parent.mkdir(parents=True, exist_ok=True)
     dictionary_path.write_text(json.dumps(word_to_id, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    save_dictionary_metadata(dictionary_path, word_to_id)
     return word_to_id
 
 
-def load_dictionary(path: str | Path):
-    raw = json.loads(Path(path).read_text(encoding="utf-8"))
+def load_dictionary(path: str | Path, with_metadata: bool = False):
+    path = Path(path)
+    raw = json.loads(path.read_text(encoding="utf-8"))
     word_to_id = {str(k): int(v) for k, v in raw.items()}
     id_to_word = {v: k for k, v in word_to_id.items()}
-    return word_to_id, id_to_word
+    if not with_metadata:
+        return word_to_id, id_to_word
+
+    meta_path = metadata_path(path)
+    metadata = None
+    if meta_path.exists():
+        metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+    if not isinstance(metadata, dict) or len(metadata.get("token_types", [])) != len(word_to_id):
+        metadata = build_dictionary_metadata(word_to_id)
+        meta_path.parent.mkdir(parents=True, exist_ok=True)
+        meta_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    token_types = [int(v) for v in metadata["token_types"]]
+    return word_to_id, id_to_word, token_types, metadata
 
 
 def encode_text(text: str, word_to_id: dict[str, int]) -> list[int]:
@@ -130,11 +198,7 @@ def encode_prompt(text: str, word_to_id: dict[str, int]) -> list[int]:
     ]
 
 
-def _compact_record(
-    ids: list[int],
-    sections: list[int],
-    max_len: int,
-) -> tuple[list[int], list[int]]:
+def _compact_record(ids: list[int], sections: list[int], max_len: int) -> tuple[list[int], list[int]]:
     """Keep prompt and final answer together when a reasoning trace is too long."""
     if max_len < 8:
         raise ValueError("max_len must be at least 8")
