@@ -27,7 +27,8 @@ def main():
     word_to_id, id_to_word = load_dictionary("data/dictionary.json")
     checkpoint = torch.load(args.model, map_location=device, weights_only=True)
     cfg = checkpoint["config"].copy()
-    cfg.pop("dictionary", None)
+    for key in ("dictionary", "dataset", "repeats"):
+        cfg.pop(key, None)
 
     model = LLN(**cfg).to(device)
     model.load_state_dict(checkpoint["model"])
