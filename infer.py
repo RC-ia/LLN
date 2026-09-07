@@ -39,15 +39,21 @@ def main():
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA requested but CUDA is not available")
 
-    word_to_id, id_to_word = load_dictionary("data/dictionary.json")
+    word_to_id, id_to_word, token_types, dictionary_meta = load_dictionary(
+        "data/dictionary.json", with_metadata=True
+    )
     checkpoint = torch.load(args.model, map_location=device, weights_only=True)
     cfg = checkpoint["config"].copy()
 
-    model_keys = {"vocab_size", "dim", "layers", "heads", "max_seq_len", "dropout"}
+    model_keys = {
+        "vocab_size", "dim", "layers", "heads", "max_seq_len", "dropout",
+        "recurrent_steps", "output_clusters", "memory_slots", "type_count",
+    }
     cfg = {key: value for key, value in cfg.items() if key in model_keys}
 
     model_dtype = checkpoint_dtype(checkpoint)
     model = LLN(**cfg).to(device=device, dtype=model_dtype)
+    model.set_token_types(token_types)
     model.load_state_dict(checkpoint["model"])
     model.eval()
 
@@ -65,7 +71,12 @@ def main():
         stop_ids={word_to_id["</ANSWER>"], word_to_id["<EOS>"]},
     )[0].tolist()
 
+    print("architecture_version:", LLN.ARCHITECTURE_VERSION)
     print("dtype:", model_dtype)
+    print("recurrent_steps:", model.recurrent_steps)
+    print("output_clusters:", model.output_clusters)
+    print("memory_slots:", model.memory_slots)
+    print("dictionary_types:", dictionary_meta.get("type_names", {}))
     print("temperature:", args.temperature)
     print("repetition_penalty:", args.repetition_penalty)
     print("no_repeat_ngram:", args.no_repeat_ngram)
