@@ -159,7 +159,9 @@ def _compact_record(
             answer_sections = answer_sections[:len(answer_ids)]
             return prompt_ids + answer_ids, prompt_sections + answer_sections
 
-    think_open = ids.index(next(i for i, s in enumerate(sections) if s == SECTION_THINK)) if SECTION_THINK in sections else None
+    # sections and ids are parallel arrays; locate the THINK section directly
+    # in the section labels instead of searching the token IDs for a section index.
+    think_open = next((i for i, s in enumerate(sections) if s == SECTION_THINK), None)
     if think_open is not None and remaining > 0:
         # Take the beginning of the reasoning so it remains causally connected
         # to the question, then keep the full final answer.
