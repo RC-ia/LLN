@@ -1,4 +1,6 @@
 import argparse
+import math
+import random
 import time
 from pathlib import Path
 
@@ -8,7 +10,7 @@ from lln.data import build_dataset, load_dictionary, make_batch
 from lln.model import LLN, parameter_count, parameter_size_mb
 
 
-LOSS_SCHEME_VERSION = 4
+LOSS_SCHEME_VERSION = 5
 ARCHITECTURE_VERSION = LLN.ARCHITECTURE_VERSION
 
 
@@ -66,6 +68,16 @@ def copy_grads_to_master(model: torch.nn.Module, master_params) -> None:
                 master_param.grad.copy_(grad)
 
 
+def learning_rate_at(step: int, base_lr: float, min_lr: float, warmup_steps: int, total_schedule_steps: int) -> float:
+    if warmup_steps > 0 and step <= warmup_steps:
+        frac = step / float(warmup_steps)
+        return base_lr * max(frac, 1e-3)
+    decay_span = max(1, total_schedule_steps - warmup_steps)
+    progress = min(1.0, max(0.0, (step - warmup_steps) / float(decay_span)))
+    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+    return min_lr + (base_lr - min_lr) * cosine
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train LLN on bounded complete examples")
     parser.add_argument("--dataset", default="data/dataset.json")
@@ -79,11 +91,14 @@ def main():
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--steps", type=int, default=2000, help="Additional steps to run")
     parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--min-lr", type=float, default=3e-5)
+    parser.add_argument("--warmup-steps", type=int, default=100)
     parser.add_argument("--think-weight", type=float, default=0.25)
     parser.add_argument("--answer-weight", type=float, default=1.0)
     parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument("--save", default="lln_model.pt")
-    parser.add_argument("--repeats", type=int, default=2000)
+    parser.add_argument("--repeats", type=int, default=2000, help="Examples per prepared epoch; defaults to one full dataset pass")
+    parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--no-resume", action="store_true")
     args = parser.parse_args()
 
@@ -91,6 +106,10 @@ def main():
         raise ValueError("--seq-len must be at least 8")
     if args.batch_size < 1:
         raise ValueError("--batch-size must be at least 1")
+    if args.warmup_steps < 0:
+        raise ValueError("--warmup-steps must be >= 0")
+    if args.min_lr <= 0.0 or args.min_lr > args.lr:
+        raise ValueError("--min-lr must be > 0 and <= --lr")
 
     if args.device == "auto":
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -100,18 +119,19 @@ def main():
             raise RuntimeError("CUDA requested but CUDA is not available")
 
     dtype = pick_dtype(args.dtype, device)
+    random.seed(args.seed)
+    torch.manual_seed(args.seed)
 
     data = build_dataset(
         args.dataset,
         args.dictionary,
         repeats=args.repeats,
-        seed=1234,
+        seed=args.seed,
         max_len=args.seq_len,
         return_sections=True,
     )
     word_to_id, _ = load_dictionary(args.dictionary)
 
-    max_record_len = max(len(ids) for ids, _ in data)
     model_cfg = {
         "vocab_size": len(word_to_id),
         "dim": args.dim,
@@ -125,6 +145,8 @@ def main():
     start_step = 0
     resumed = False
     checkpoint_grad_scale = None
+    checkpoint_epoch = 0
+    checkpoint_cursor = 0
 
     if save_path.exists() and not args.no_resume:
         print(f"checkpoint={save_path} found; attempting to resume")
@@ -147,9 +169,10 @@ def main():
             resumed = True
             start_step = int(checkpoint.get("step", 0))
             checkpoint_grad_scale = checkpoint.get("grad_scale")
+            checkpoint_epoch = int(checkpoint.get("epoch", 0))
+            checkpoint_cursor = int(checkpoint.get("epoch_cursor", 0))
 
     model = LLN(**model_cfg).to(device=device, dtype=dtype)
-
     if checkpoint is not None:
         model.load_state_dict(checkpoint["model"])
 
@@ -176,13 +199,15 @@ def main():
     print(f"device={device} dtype={dtype}")
     print(f"parameters={n_params:,} model_weight_size={mb:.1f} MB")
     print(f"master_weight_size={master_mb:.1f} MB")
-    print(f"vocab={len(word_to_id)} records={len(data):,} max_training_record_ids={max_record_len:,}")
+    print(f"vocab={len(word_to_id)} records={len(data):,}")
     print(f"seq_len={args.seq_len} batch_size={args.batch_size}")
     print(f"loss_weights=prompt:0 think:{args.think_weight:g} answer:{args.answer_weight:g}")
     print("long_record_policy=preserve_prompt_and_answer_truncate_think")
     print("optimizer=AdamW fp32_master_params")
     print(f"architecture_version={ARCHITECTURE_VERSION}")
-    print(f"resume={resumed} starting_step={start_step}")
+    print(f"training_schedule=warmup:{args.warmup_steps} max_lr:{args.lr:g} min_lr:{args.min_lr:g}")
+    print("sampling_policy=shuffled_epoch_without_replacement")
+    print(f"resume={resumed} starting_step={start_step} epoch={checkpoint_epoch} cursor={checkpoint_cursor}")
 
     grad_scale = float(checkpoint_grad_scale) if checkpoint_grad_scale is not None else (
         1024.0 if (device.type == "cuda" and dtype == torch.float16) else 1.0
@@ -191,16 +216,39 @@ def main():
         grad_scale = 1024.0 if (device.type == "cuda" and dtype == torch.float16) else 1.0
     print(f"grad_scale_start={grad_scale:g}")
 
+    epoch = checkpoint_epoch
+    cursor = checkpoint_cursor
+    order = list(range(len(data)))
+    random.Random(args.seed + epoch).shuffle(order)
+    if cursor >= len(order):
+        epoch += 1
+        cursor = 0
+        order = list(range(len(data)))
+        random.Random(args.seed + epoch).shuffle(order)
+
+    total_schedule_steps = max(1, start_step + args.steps)
     model.train()
     start = time.perf_counter()
     last_log = start
 
     for local_step in range(1, args.steps + 1):
         global_step = start_step + local_step
-        x, y, batch_sections = make_batch(data, args.batch_size, args.seq_len, device)
+        if cursor + args.batch_size > len(order):
+            epoch += 1
+            cursor = 0
+            order = list(range(len(data)))
+            random.Random(args.seed + epoch).shuffle(order)
+        batch_indices = order[cursor:cursor + args.batch_size]
+        cursor += args.batch_size
+
+        x, y, batch_sections = make_batch(data, args.batch_size, args.seq_len, device, indices=batch_indices)
         loss_weights = sections_to_weights(batch_sections, args.think_weight, args.answer_weight)
         optimizer.zero_grad(set_to_none=True)
         model.zero_grad(set_to_none=True)
+
+        current_lr = learning_rate_at(global_step, args.lr, args.min_lr, args.warmup_steps, total_schedule_steps)
+        for group in optimizer.param_groups:
+            group["lr"] = current_lr
 
         with torch.autocast(
             device_type=device.type,
@@ -223,6 +271,7 @@ def main():
             if found_inf:
                 model.zero_grad(set_to_none=True)
                 grad_scale = max(1.0, grad_scale / 2.0)
+                cursor -= args.batch_size
                 if local_step == 1 or local_step % args.log_every == 0:
                     print(f"step={global_step:6d} skipped=nonfinite_grad grad_scale={grad_scale:g}")
                 continue
@@ -232,14 +281,12 @@ def main():
         copy_grads_to_master(model, master_params)
         torch.nn.utils.clip_grad_norm_(master_params, 1.0)
 
-        if not all(
-            p.grad is None or torch.isfinite(p.grad).all()
-            for p in master_params
-        ):
+        if not all(p.grad is None or torch.isfinite(p.grad).all() for p in master_params):
             model.zero_grad(set_to_none=True)
             for p in master_params:
                 p.grad = None
             grad_scale = max(1.0, grad_scale / 2.0)
+            cursor -= args.batch_size
             continue
 
         optimizer.step()
@@ -256,7 +303,7 @@ def main():
             elapsed = max(now - last_log, 1e-9)
             window_steps = args.log_every if local_step > args.log_every else local_step
             tokens_s = (args.batch_size * args.seq_len * window_steps) / elapsed
-            print(f"step={global_step:6d} loss={loss.item():.6f} tok/s={tokens_s:,.0f} grad_scale={grad_scale:g}")
+            print(f"step={global_step:6d} loss={loss.item():.6f} tok/s={tokens_s:,.0f} lr={current_lr:.6g} grad_scale={grad_scale:g}")
             last_log = now
 
     torch.save({
@@ -265,6 +312,8 @@ def main():
         "optimizer": optimizer.state_dict(),
         "step": start_step + args.steps,
         "grad_scale": grad_scale,
+        "epoch": epoch,
+        "epoch_cursor": cursor,
         "config": {
             **model_cfg,
             "dictionary": str(args.dictionary),
@@ -275,6 +324,12 @@ def main():
             "answer_weight": args.answer_weight,
             "dtype": str(dtype),
             "optimizer": "AdamW_fp32_master",
+            "schedule": "warmup_cosine",
+            "base_lr": args.lr,
+            "min_lr": args.min_lr,
+            "warmup_steps": args.warmup_steps,
+            "seed": args.seed,
+            "sampling_policy": "shuffled_epoch_without_replacement",
         },
     }, save_path)
     print(f"saved={save_path}")
