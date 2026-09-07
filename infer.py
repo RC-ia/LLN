@@ -33,11 +33,19 @@ def main():
     word_to_id, id_to_word = load_dictionary("data/dictionary.json")
     checkpoint = torch.load(args.model, map_location=device, weights_only=True)
     cfg = checkpoint["config"].copy()
-    for key in ("dictionary", "dataset", "loss_scheme_version", "think_weight", "answer_weight"):
+    for key in ("dictionary", "dataset", "loss_scheme_version", "think_weight", "answer_weight", "dtype"):
         cfg.pop(key, None)
 
-    model = LLN(**cfg).to(device)
+    model = LLN(**cfg)
     model.load_state_dict(checkpoint["model"])
+
+    # Preserve the checkpoint precision for inference. Older checkpoints without
+    # an explicit dtype are treated as FP32.
+    model_dtype = next(model.parameters()).dtype
+    if device.type == "cuda":
+        model = model.to(device=device, dtype=model_dtype)
+    else:
+        model = model.to(device=device, dtype=model_dtype)
     model.eval()
 
     ids = torch.tensor(
@@ -54,6 +62,7 @@ def main():
         stop_ids={word_to_id["</ANSWER>"], word_to_id["<EOS>"]},
     )[0].tolist()
 
+    print("dtype:", model_dtype)
     print("temperature:", args.temperature)
     print("repetition_penalty:", args.repetition_penalty)
     print("no_repeat_ngram:", args.no_repeat_ngram)
