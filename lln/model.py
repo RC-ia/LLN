@@ -60,30 +60,19 @@ class Block(nn.Module):
 class LLN(nn.Module):
     """Numeric-token language model with explicit structured sections."""
 
-    def __init__(
-        self,
-        vocab_size: int,
-        dim: int = 512,
-        layers: int = 8,
-        heads: int = 8,
-        max_seq_len: int = 256,
-        dropout: float = 0.0,
-    ):
+    def __init__(self, vocab_size: int, dim: int = 512, layers: int = 8, heads: int = 8,
+                 max_seq_len: int = 256, dropout: float = 0.0):
         super().__init__()
         self.vocab_size = vocab_size
         self.dim = dim
         self.layers = layers
         self.heads = heads
         self.max_seq_len = max_seq_len
-
         self.token = nn.Embedding(vocab_size, dim)
         self.position = nn.Embedding(max_seq_len, dim)
-        self.blocks = nn.ModuleList([
-            Block(dim, heads, dropout) for _ in range(layers)
-        ])
+        self.blocks = nn.ModuleList([Block(dim, heads, dropout) for _ in range(layers)])
         self.norm = nn.LayerNorm(dim)
         self.lm_head = nn.Linear(dim, vocab_size, bias=False)
-
         self.apply(self._init_weights)
 
     def _init_weights(self, module: nn.Module) -> None:
@@ -94,12 +83,8 @@ class LLN(nn.Module):
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        targets: torch.Tensor | None = None,
-        loss_weights: torch.Tensor | None = None,
-    ):
+    def forward(self, input_ids: torch.Tensor, targets: torch.Tensor | None = None,
+                loss_weights: torch.Tensor | None = None):
         _, t = input_ids.shape
         if t > self.max_seq_len:
             raise ValueError(f"sequence length {t} > max_seq_len {self.max_seq_len}")
@@ -108,16 +93,11 @@ class LLN(nn.Module):
         for block in self.blocks:
             x = block(x)
         logits = self.lm_head(self.norm(x))
-
         loss = None
         if targets is not None:
             flat_logits = logits.reshape(-1, self.vocab_size)
             flat_targets = targets.reshape(-1)
-            token_loss = nn.functional.cross_entropy(
-                flat_logits,
-                flat_targets,
-                reduction="none",
-            )
+            token_loss = nn.functional.cross_entropy(flat_logits, flat_targets, reduction="none")
             if loss_weights is None:
                 loss = token_loss.mean()
             else:
@@ -129,14 +109,9 @@ class LLN(nn.Module):
         return logits, loss
 
     @torch.no_grad()
-    def generate(
-        self,
-        input_ids: torch.Tensor,
-        max_new_tokens: int = 128,
-        temperature: float = 1.0,
-        repetition_penalty: float = 1.15,
-        no_repeat_ngram_size: int = 3,
-    ):
+    def generate(self, input_ids: torch.Tensor, max_new_tokens: int = 128,
+                 temperature: float = 1.0, repetition_penalty: float = 1.15,
+                 no_repeat_ngram_size: int = 3, stop_ids=None):
         self.eval()
         if temperature <= 0.0:
             raise ValueError("temperature must be > 0")
@@ -144,8 +119,8 @@ class LLN(nn.Module):
             raise ValueError("repetition_penalty must be >= 1.0")
         if no_repeat_ngram_size < 0:
             raise ValueError("no_repeat_ngram_size must be >= 0")
+        stop_ids = set(stop_ids or {2})
 
-        eos_id = 2
         for _ in range(max_new_tokens):
             x = input_ids[:, -self.max_seq_len:]
             logits, _ = self(x)
@@ -180,7 +155,7 @@ class LLN(nn.Module):
                 next_id = torch.multinomial(probabilities, num_samples=1)
 
             input_ids = torch.cat([input_ids, next_id], dim=1)
-            if (next_id == eos_id).all():
+            if all(int(next_id[i, 0]) in stop_ids for i in range(next_id.size(0))):
                 break
         return input_ids
 
