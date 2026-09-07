@@ -121,34 +121,75 @@ def encode_record(record: tuple[str, str | None, str], word_to_id: dict[str, int
 
 
 def encode_prompt(text: str, word_to_id: dict[str, int]) -> list[int]:
-    return [word_to_id["<BOS>"], word_to_id["<USER>"], *encode_text(text, word_to_id), word_to_id["</USER>"], word_to_id["<THINK>"]]
+    return [
+        word_to_id["<BOS>"],
+        word_to_id["<USER>"],
+        *encode_text(text, word_to_id),
+        word_to_id["</USER>"],
+        word_to_id["<THINK>"],
+    ]
 
 
-def build_dataset(dataset_path: str | Path = DEFAULT_DATASET, dictionary_path: str | Path = DEFAULT_DICTIONARY,
-                  repeats: int = 1, seed: int = 1234, return_sections: bool = False):
+def _compact_record(
+    ids: list[int],
+    sections: list[int],
+    max_len: int,
+) -> tuple[list[int], list[int]]:
+    """Keep prompt and final answer together when a reasoning trace is too long."""
+    if max_len < 8:
+        raise ValueError("max_len must be at least 8")
+    if len(ids) <= max_len:
+        return ids, sections
+
+    answer_start = next(i for i, s in enumerate(sections) if s == SECTION_ANSWER)
+    prompt_ids = ids[:answer_start]
+    prompt_sections = sections[:answer_start]
+    answer_ids = ids[answer_start:]
+    answer_sections = sections[answer_start:]
+
+    remaining = max_len - len(prompt_ids) - len(answer_ids)
+    if remaining < 0:
+        # The prompt + answer alone is too long. Preserve the complete answer
+        # and trim only the oldest prompt tokens to fit the context window.
+        prompt_ids = prompt_ids[max(0, -remaining):]
+        prompt_sections = prompt_sections[-len(prompt_ids):] if prompt_ids else []
+        remaining = max_len - len(prompt_ids) - len(answer_ids)
+        if remaining < 0:
+            answer_ids = answer_ids[:max_len - len(prompt_ids)]
+            answer_sections = answer_sections[:len(answer_ids)]
+            return prompt_ids + answer_ids, prompt_sections + answer_sections
+
+    think_open = ids.index(next(i for i, s in enumerate(sections) if s == SECTION_THINK)) if SECTION_THINK in sections else None
+    if think_open is not None and remaining > 0:
+        # Take the beginning of the reasoning so it remains causally connected
+        # to the question, then keep the full final answer.
+        think_content_start = think_open
+        think_content_end = answer_start
+        keep_think = ids[think_content_start:think_content_end][:remaining]
+        keep_sec = sections[think_content_start:think_content_start + len(keep_think)]
+        return prompt_ids + keep_think + answer_ids, prompt_sections + keep_sec + answer_sections
+
+    return prompt_ids + answer_ids, prompt_sections + answer_sections
+
+
+def build_dataset(
+    dataset_path: str | Path = DEFAULT_DATASET,
+    dictionary_path: str | Path = DEFAULT_DICTIONARY,
+    repeats: int = 1,
+    seed: int = 1234,
+    return_sections: bool = False,
+    max_len: int | None = None,
+):
     records = load_records(dataset_path)
     word_to_id = create_dictionary_from_dataset(dataset_path, dictionary_path)
     rng = random.Random(seed)
     sequences = [encode_record(record, word_to_id) for record in records]
+
+    if max_len is not None:
+        sequences = [_compact_record(ids, sec, max_len + 1) for ids, sec in sequences]
+
     selected = [rng.choice(sequences) for _ in range(max(1, repeats))]
     return selected
-
-
-def _window_start(ids: list[int], sections: list[int], seq_len: int) -> int:
-    """Choose a bounded window inside one record, never across records."""
-    if len(ids) <= seq_len + 1:
-        return 0
-
-    max_start = len(ids) - (seq_len + 1)
-    prompt_end = next((i for i, section in enumerate(sections) if section != SECTION_PROMPT), len(sections))
-    answer_start = next((i for i, section in enumerate(sections) if section == SECTION_ANSWER), len(sections))
-
-    candidates = [0]
-    if answer_start < len(ids):
-        candidates.append(min(max(0, answer_start - seq_len // 2), max_start))
-    if prompt_end < len(ids):
-        candidates.append(min(max(0, prompt_end - seq_len // 4), max_start))
-    return random.choice(candidates)
 
 
 def make_batch(data, batch_size: int, seq_len: int, device, sections=None):
@@ -156,32 +197,29 @@ def make_batch(data, batch_size: int, seq_len: int, device, sections=None):
         raise ValueError("Dataset contains no training examples")
     if sections is not None:
         raise ValueError("sections argument is no longer used; build_dataset returns complete records")
-    if seq_len < 8:
-        raise ValueError("seq_len must be at least 8")
 
     chosen = [random.choice(data) for _ in range(batch_size)]
     x_rows, y_rows, w_rows = [], [], []
     pad_id = 0
 
     for ids, sec in chosen:
-        start = _window_start(ids, sec, seq_len)
-        window_ids = ids[start:start + seq_len + 1]
-        window_sec = sec[start:start + seq_len + 1]
-        if len(window_ids) < 2:
+        if len(ids) > seq_len + 1:
+            raise ValueError("Training record exceeds seq_len; build_dataset must be called with max_len=seq_len")
+        if len(ids) < 2:
             continue
 
-        x_ids = window_ids[:-1]
-        y_ids = window_ids[1:]
-        y_sec = window_sec[1:]
+        x_ids = ids[:-1]
+        y_ids = ids[1:]
+        y_sec = sec[1:]
         pad_count = seq_len - len(x_ids)
         if pad_count > 0:
             x_ids += [pad_id] * pad_count
             y_ids += [pad_id] * pad_count
             y_sec += [-1] * pad_count
 
-        x_rows.append(x_ids[:seq_len])
-        y_rows.append(y_ids[:seq_len])
-        w_rows.append(y_sec[:seq_len])
+        x_rows.append(x_ids)
+        y_rows.append(y_ids)
+        w_rows.append(y_sec)
 
     if not x_rows:
         raise ValueError("No valid training examples")
