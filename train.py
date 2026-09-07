@@ -123,6 +123,7 @@ def main():
     checkpoint = None
     start_step = 0
     resumed = False
+    checkpoint_grad_scale = None
 
     if save_path.exists() and not args.no_resume:
         print(f"checkpoint={save_path} found; attempting to resume")
@@ -141,6 +142,7 @@ def main():
         else:
             resumed = True
             start_step = int(checkpoint.get("step", 0))
+            checkpoint_grad_scale = checkpoint.get("grad_scale")
 
     model = LLN(**model_cfg).to(device=device, dtype=dtype)
 
@@ -162,6 +164,7 @@ def main():
                 optimizer.load_state_dict(saved_optimizer)
             except (ValueError, RuntimeError):
                 print("checkpoint optimizer state incompatible; reinitializing optimizer")
+        copy_master_to_model(model, master_params)
 
     n_params = parameter_count(model)
     mb = parameter_size_mb(model, torch.tensor([], dtype=dtype).element_size())
@@ -176,7 +179,12 @@ def main():
     print("optimizer=AdamW fp32_master_params")
     print(f"resume={resumed} starting_step={start_step}")
 
-    grad_scale = 1024.0 if (device.type == "cuda" and dtype == torch.float16) else 1.0
+    grad_scale = float(checkpoint_grad_scale) if checkpoint_grad_scale is not None else (
+        1024.0 if (device.type == "cuda" and dtype == torch.float16) else 1.0
+    )
+    if grad_scale <= 0.0:
+        grad_scale = 1024.0 if (device.type == "cuda" and dtype == torch.float16) else 1.0
+    print(f"grad_scale_start={grad_scale:g}")
 
     model.train()
     start = time.perf_counter()
@@ -251,6 +259,7 @@ def main():
         "master_params": [p.detach().cpu() for p in master_params],
         "optimizer": optimizer.state_dict(),
         "step": start_step + args.steps,
+        "grad_scale": grad_scale,
         "config": {
             **model_cfg,
             "dictionary": str(args.dictionary),
