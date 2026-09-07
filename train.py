@@ -37,6 +37,34 @@ def sections_to_weights(sections: torch.Tensor, think_weight: float, answer_weig
     )
 
 
+def make_master_parameters(model: torch.nn.Module):
+    return [torch.nn.Parameter(p.detach().float().clone(), requires_grad=True) for p in model.parameters()]
+
+
+def copy_model_to_master(model: torch.nn.Module, master_params) -> None:
+    with torch.no_grad():
+        for model_param, master_param in zip(model.parameters(), master_params):
+            master_param.copy_(model_param.float())
+
+
+def copy_master_to_model(model: torch.nn.Module, master_params) -> None:
+    with torch.no_grad():
+        for model_param, master_param in zip(model.parameters(), master_params):
+            model_param.copy_(master_param.to(dtype=model_param.dtype))
+
+
+def copy_grads_to_master(model: torch.nn.Module, master_params) -> None:
+    for model_param, master_param in zip(model.parameters(), master_params):
+        if model_param.grad is None:
+            master_param.grad = None
+        else:
+            grad = model_param.grad.detach().float()
+            if master_param.grad is None:
+                master_param.grad = grad.clone()
+            else:
+                master_param.grad.copy_(grad)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train LLN on bounded complete examples")
     parser.add_argument("--dataset", default="data/dataset.json")
@@ -115,27 +143,39 @@ def main():
             start_step = int(checkpoint.get("step", 0))
 
     model = LLN(**model_cfg).to(device=device, dtype=dtype)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
 
     if checkpoint is not None:
         model.load_state_dict(checkpoint["model"])
+
+    master_params = make_master_parameters(model)
+    optimizer = torch.optim.AdamW(master_params, lr=args.lr, weight_decay=0.01)
+    if checkpoint is not None:
         saved_optimizer = checkpoint.get("optimizer")
+        saved_master = checkpoint.get("master_params")
+        if saved_master is not None and len(saved_master) == len(master_params):
+            for master_param, saved_value in zip(master_params, saved_master):
+                master_param.data.copy_(saved_value.to(device=device, dtype=torch.float32))
+        else:
+            copy_model_to_master(model, master_params)
         if saved_optimizer is not None:
-            optimizer.load_state_dict(saved_optimizer)
+            try:
+                optimizer.load_state_dict(saved_optimizer)
+            except (ValueError, RuntimeError):
+                print("checkpoint optimizer state incompatible; reinitializing optimizer")
 
     n_params = parameter_count(model)
     mb = parameter_size_mb(model, torch.tensor([], dtype=dtype).element_size())
+    master_mb = parameter_size_mb(model, 4)
     print(f"device={device} dtype={dtype}")
     print(f"parameters={n_params:,} model_weight_size={mb:.1f} MB")
+    print(f"master_weight_size={master_mb:.1f} MB")
     print(f"vocab={len(word_to_id)} records={len(data):,} max_training_record_ids={max_record_len:,}")
     print(f"seq_len={args.seq_len} batch_size={args.batch_size}")
     print(f"loss_weights=prompt:0 think:{args.think_weight:g} answer:{args.answer_weight:g}")
     print("long_record_policy=preserve_prompt_and_answer_truncate_think")
+    print("optimizer=AdamW fp32_master_params")
     print(f"resume={resumed} starting_step={start_step}")
 
-    # Pure FP16 keeps the model weights and optimizer state in half precision.
-    # GradScaler cannot unscale native FP16 parameter gradients, so use explicit
-    # loss scaling and gradient unscaling here instead.
     grad_scale = 1024.0 if (device.type == "cuda" and dtype == torch.float16) else 1.0
 
     model.train()
@@ -147,6 +187,7 @@ def main():
         x, y, batch_sections = make_batch(data, args.batch_size, args.seq_len, device)
         loss_weights = sections_to_weights(batch_sections, args.think_weight, args.answer_weight)
         optimizer.zero_grad(set_to_none=True)
+        model.zero_grad(set_to_none=True)
 
         with torch.autocast(
             device_type=device.type,
@@ -167,19 +208,35 @@ def main():
                     found_inf = True
                     break
             if found_inf:
-                optimizer.zero_grad(set_to_none=True)
+                model.zero_grad(set_to_none=True)
                 grad_scale = max(1.0, grad_scale / 2.0)
+                if local_step == 1 or local_step % args.log_every == 0:
+                    print(f"step={global_step:6d} skipped=nonfinite_grad grad_scale={grad_scale:g}")
                 continue
         else:
             loss.backward()
 
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
+        copy_grads_to_master(model, master_params)
+        torch.nn.utils.clip_grad_norm_(master_params, 1.0)
 
-        if dtype == torch.float16 and device.type == "cuda":
-            # Increase scaling slowly when the current scale remains finite.
-            if grad_scale < 65536.0:
-                grad_scale = min(65536.0, grad_scale * 1.001)
+        if not all(
+            p.grad is None or torch.isfinite(p.grad).all()
+            for p in master_params
+        ):
+            model.zero_grad(set_to_none=True)
+            for p in master_params:
+                p.grad = None
+            grad_scale = max(1.0, grad_scale / 2.0)
+            continue
+
+        optimizer.step()
+        copy_master_to_model(model, master_params)
+        model.zero_grad(set_to_none=True)
+        for p in master_params:
+            p.grad = None
+
+        if dtype == torch.float16 and device.type == "cuda" and grad_scale < 65536.0:
+            grad_scale = min(65536.0, grad_scale * 1.001)
 
         if local_step == 1 or local_step % args.log_every == 0 or local_step == args.steps:
             now = time.perf_counter()
@@ -191,6 +248,7 @@ def main():
 
     torch.save({
         "model": model.state_dict(),
+        "master_params": [p.detach().cpu() for p in master_params],
         "optimizer": optimizer.state_dict(),
         "step": start_step + args.steps,
         "config": {
@@ -201,6 +259,7 @@ def main():
             "think_weight": args.think_weight,
             "answer_weight": args.answer_weight,
             "dtype": str(dtype),
+            "optimizer": "AdamW_fp32_master",
         },
     }, save_path)
     print(f"saved={save_path}")
