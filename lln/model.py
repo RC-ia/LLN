@@ -99,7 +99,12 @@ class LLN(nn.Module):
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, input_ids: torch.Tensor, targets: torch.Tensor | None = None):
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        targets: torch.Tensor | None = None,
+        loss_weights: torch.Tensor | None = None,
+    ):
         _, t = input_ids.shape
         if t > self.max_seq_len:
             raise ValueError(f"sequence length {t} > max_seq_len {self.max_seq_len}")
@@ -111,9 +116,21 @@ class LLN(nn.Module):
 
         loss = None
         if targets is not None:
-            loss = nn.functional.cross_entropy(
-                logits.reshape(-1, self.vocab_size), targets.reshape(-1)
+            flat_logits = logits.reshape(-1, self.vocab_size)
+            flat_targets = targets.reshape(-1)
+            token_loss = nn.functional.cross_entropy(
+                flat_logits,
+                flat_targets,
+                reduction="none",
             )
+            if loss_weights is None:
+                loss = token_loss.mean()
+            else:
+                flat_weights = loss_weights.reshape(-1).to(token_loss.dtype)
+                weight_sum = flat_weights.sum()
+                if weight_sum.item() <= 0.0:
+                    raise ValueError("loss_weights must contain at least one positive weight")
+                loss = (token_loss * flat_weights).sum() / weight_sum
         return logits, loss
 
     @torch.no_grad()
