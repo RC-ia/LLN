@@ -8,7 +8,7 @@ from lln.data import build_dataset, load_dictionary, make_batch
 from lln.model import LLN, parameter_count, parameter_size_mb
 
 
-LOSS_SCHEME_VERSION = 1
+LOSS_SCHEME_VERSION = 2
 
 
 def pick_dtype(name: str, device: torch.device):
@@ -24,7 +24,6 @@ def pick_dtype(name: str, device: torch.device):
 
 
 def sections_to_weights(sections: torch.Tensor, think_weight: float, answer_weight: float) -> torch.Tensor:
-    """Convert persistent section IDs into per-target loss weights."""
     if think_weight < 0.0 or answer_weight <= 0.0:
         raise ValueError("think_weight must be >= 0 and answer_weight must be > 0")
     return torch.where(
@@ -39,7 +38,7 @@ def sections_to_weights(sections: torch.Tensor, think_weight: float, answer_weig
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train LLN on integer token IDs")
+    parser = argparse.ArgumentParser(description="Train LLN on complete structured examples")
     parser.add_argument("--dataset", default="data/dataset.json")
     parser.add_argument("--dictionary", default="data/dictionary.json")
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
@@ -47,16 +46,16 @@ def main():
     parser.add_argument("--dim", type=int, default=512)
     parser.add_argument("--layers", type=int, default=8)
     parser.add_argument("--heads", type=int, default=8)
-    parser.add_argument("--seq-len", type=int, default=32)
-    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--seq-len", type=int, default=512)
+    parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--steps", type=int, default=2000, help="Additional steps to run")
     parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--think-weight", type=float, default=0.25, help="Relative loss weight for <THINK> content")
-    parser.add_argument("--answer-weight", type=float, default=1.0, help="Relative loss weight for <ANSWER> content")
+    parser.add_argument("--think-weight", type=float, default=0.25)
+    parser.add_argument("--answer-weight", type=float, default=1.0)
     parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument("--save", default="lln_model.pt")
     parser.add_argument("--repeats", type=int, default=2000)
-    parser.add_argument("--no-resume", action="store_true", help="Ignore an existing checkpoint")
+    parser.add_argument("--no-resume", action="store_true")
     args = parser.parse_args()
 
     if args.device == "auto":
@@ -68,20 +67,23 @@ def main():
 
     dtype = pick_dtype(args.dtype, device)
 
-    data, sections = build_dataset(
+    data = build_dataset(
         args.dataset,
         args.dictionary,
         repeats=args.repeats,
+        seed=1234,
         return_sections=True,
     )
     word_to_id, _ = load_dictionary(args.dictionary)
 
+    max_record_len = max(len(ids) for ids, _ in data)
+    effective_seq_len = max(args.seq_len, max_record_len - 1)
     model_cfg = {
         "vocab_size": len(word_to_id),
         "dim": args.dim,
         "layers": args.layers,
         "heads": args.heads,
-        "max_seq_len": max(args.seq_len, 256),
+        "max_seq_len": effective_seq_len,
     }
 
     save_path = Path(args.save)
@@ -94,12 +96,11 @@ def main():
         checkpoint = torch.load(save_path, map_location=device, weights_only=True)
         saved_cfg = checkpoint.get("config", {})
         comparable = {k: saved_cfg.get(k) for k in model_cfg}
-
         if comparable != model_cfg:
-            print("checkpoint architecture/vocabulary differs from current dataset/config; starting a new model")
+            print("checkpoint architecture/vocabulary or sequence length differs; starting a new model")
             checkpoint = None
         elif saved_cfg.get("loss_scheme_version") != LOSS_SCHEME_VERSION:
-            print("checkpoint uses an older loss objective; starting a new model")
+            print("checkpoint uses an older training objective; starting a new model")
             checkpoint = None
         elif saved_cfg.get("think_weight") != args.think_weight or saved_cfg.get("answer_weight") != args.answer_weight:
             print("checkpoint loss weights differ from current config; starting a new model")
@@ -116,32 +117,24 @@ def main():
         saved_optimizer = checkpoint.get("optimizer")
         if saved_optimizer is not None:
             optimizer.load_state_dict(saved_optimizer)
-        else:
-            print("checkpoint has no optimizer state; resuming model weights with a fresh optimizer")
 
     n_params = parameter_count(model)
     mb = parameter_size_mb(model, torch.tensor([], dtype=dtype).element_size())
     print(f"device={device} dtype={dtype}")
     print(f"parameters={n_params:,} model_weight_size={mb:.1f} MB")
-    print(f"vocab={len(word_to_id)} dataset_ids={len(data):,}")
+    print(f"vocab={len(word_to_id)} records={len(data):,} max_record_ids={max_record_len:,}")
+    print(f"effective_seq_len={effective_seq_len}")
     print(f"loss_weights=prompt:0 think:{args.think_weight:g} answer:{args.answer_weight:g}")
     print(f"resume={resumed} starting_step={start_step}")
 
     scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda" and dtype == torch.float16))
-
     model.train()
     start = time.perf_counter()
     last_log = start
 
     for local_step in range(1, args.steps + 1):
         global_step = start_step + local_step
-        x, y, batch_sections = make_batch(
-            data,
-            args.batch_size,
-            args.seq_len,
-            device,
-            sections=sections,
-        )
+        x, y, batch_sections = make_batch(data, args.batch_size, effective_seq_len, device)
         loss_weights = sections_to_weights(batch_sections, args.think_weight, args.answer_weight)
         optimizer.zero_grad(set_to_none=True)
 
@@ -164,7 +157,7 @@ def main():
             now = time.perf_counter()
             elapsed = max(now - last_log, 1e-9)
             window_steps = args.log_every if local_step > args.log_every else local_step
-            tokens_s = (args.batch_size * args.seq_len * window_steps) / elapsed
+            tokens_s = (args.batch_size * effective_seq_len * window_steps) / elapsed
             print(f"step={global_step:6d} loss={loss.item():.6f} tok/s={tokens_s:,.0f}")
             last_log = now
 
