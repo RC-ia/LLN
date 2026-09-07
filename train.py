@@ -9,6 +9,7 @@ from lln.model import LLN, parameter_count, parameter_size_mb
 
 
 LOSS_SCHEME_VERSION = 4
+ARCHITECTURE_VERSION = LLN.ARCHITECTURE_VERSION
 
 
 def pick_dtype(name: str, device: torch.device):
@@ -133,6 +134,9 @@ def main():
         if comparable != model_cfg:
             print("checkpoint architecture/vocabulary or sequence length differs; starting a new model")
             checkpoint = None
+        elif saved_cfg.get("architecture_version") != ARCHITECTURE_VERSION:
+            print("checkpoint uses an older architecture; starting a new model")
+            checkpoint = None
         elif saved_cfg.get("loss_scheme_version") != LOSS_SCHEME_VERSION:
             print("checkpoint uses an older training objective; starting a new model")
             checkpoint = None
@@ -177,6 +181,7 @@ def main():
     print(f"loss_weights=prompt:0 think:{args.think_weight:g} answer:{args.answer_weight:g}")
     print("long_record_policy=preserve_prompt_and_answer_truncate_think")
     print("optimizer=AdamW fp32_master_params")
+    print(f"architecture_version={ARCHITECTURE_VERSION}")
     print(f"resume={resumed} starting_step={start_step}")
 
     grad_scale = float(checkpoint_grad_scale) if checkpoint_grad_scale is not None else (
@@ -265,6 +270,7 @@ def main():
             "dictionary": str(args.dictionary),
             "dataset": str(args.dataset),
             "loss_scheme_version": LOSS_SCHEME_VERSION,
+            "architecture_version": ARCHITECTURE_VERSION,
             "think_weight": args.think_weight,
             "answer_weight": args.answer_weight,
             "dtype": str(dtype),
