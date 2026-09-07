@@ -76,7 +76,7 @@ class SpecialistBank(nn.Module):
         gate_logits = self.gate(x) + self.type_bias(token_types)
         k = min(2, self.specialists)
         topv, topi = torch.topk(gate_logits, k=k, dim=-1)
-        topw = torch.softmax(topv, dim=-1)
+        topw = torch.softmax(topv.float(), dim=-1).to(x.dtype)
         result = torch.zeros_like(x)
         for expert_idx, expert in enumerate(self.experts):
             active = topi.eq(expert_idx)
@@ -143,7 +143,10 @@ class LatentReasoningMemory(nn.Module):
         state = self.state_out(state_latent)
         state = state * torch.sigmoid(self.state_gate(cumulative))
 
-        writes = torch.softmax(self.write_gate(cumulative.float()), dim=-1).to(x.dtype)
+        # Keep the Linear input in the same dtype as the FP16/BF16 model weights.
+        # Only the softmax itself is evaluated in FP32 for numerical stability.
+        write_logits = self.write_gate(cumulative)
+        writes = torch.softmax(write_logits.float(), dim=-1).to(x.dtype)
         values = torch.tanh(self.write_value(cumulative))
         memory = (writes.unsqueeze(-1) * values.unsqueeze(2)).cumsum(dim=1)
         write_norm = writes.cumsum(dim=1).unsqueeze(-1).clamp_min(1e-4)
