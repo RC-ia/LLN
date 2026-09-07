@@ -17,32 +17,26 @@ def main():
     if args.temperature <= 0.0:
         raise ValueError("--temperature must be greater than 0")
 
-    if args.device == "auto":
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    else:
-        device = torch.device(args.device)
-        if device.type == "cuda" and not torch.cuda.is_available():
-            raise RuntimeError("CUDA requested but CUDA is not available")
+    device = torch.device("cuda" if args.device == "auto" and torch.cuda.is_available() else args.device if args.device != "auto" else "cpu")
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA requested but CUDA is not available")
 
     word_to_id, id_to_word = load_dictionary("data/dictionary.json")
     checkpoint = torch.load(args.model, map_location=device, weights_only=True)
     cfg = checkpoint["config"].copy()
-    for key in ("dictionary", "dataset"):
+    for key in ("dictionary", "dataset", "loss_scheme_version", "think_weight", "answer_weight"):
         cfg.pop(key, None)
 
     model = LLN(**cfg).to(device)
     model.load_state_dict(checkpoint["model"])
     model.eval()
 
-    ids = torch.tensor(
-        [encode_prompt(args.prompt, word_to_id)],
-        dtype=torch.long,
-        device=device,
-    )
+    ids = torch.tensor([encode_prompt(args.prompt, word_to_id)], dtype=torch.long, device=device)
     out = model.generate(
         ids,
         max_new_tokens=args.new_tokens,
         temperature=args.temperature,
+        stop_ids={word_to_id["</ANSWER>"], word_to_id["<EOS>"]},
     )[0].tolist()
 
     print("temperature:", args.temperature)
