@@ -46,6 +46,8 @@ class MLP(nn.Module):
 class Block(nn.Module):
     def __init__(self, dim: int, heads: int, dropout: float = 0.0):
         super().__init__()
+        if dim % 8 != 0:
+            raise ValueError("dim must be divisible by 8 for the reasoning state")
         self.norm1 = nn.LayerNorm(dim)
         self.attn = CausalSelfAttention(dim, heads, dropout)
         self.norm2 = nn.LayerNorm(dim)
@@ -57,8 +59,30 @@ class Block(nn.Module):
         return x
 
 
+class ReasoningState(nn.Module):
+    """Compact latent state extracted at <THINK> and carried forward."""
+
+    def __init__(self, dim: int):
+        super().__init__()
+        state_dim = dim // 8
+        self.to_state = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, state_dim, bias=False),
+            nn.GELU(),
+            nn.Linear(state_dim, dim, bias=False),
+        )
+        self.gate = nn.Linear(dim, 1, bias=False)
+
+    def forward(self, think_hidden: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        state = self.to_state(think_hidden)
+        gate = torch.sigmoid(self.gate(think_hidden))
+        return x + gate * state[:, None, :]
+
+
 class LLN(nn.Module):
     """Numeric-token language model with explicit structured sections."""
+
+    ARCHITECTURE_VERSION = 2
 
     def __init__(self, vocab_size: int, dim: int = 512, layers: int = 8, heads: int = 8,
                  max_seq_len: int = 256, dropout: float = 0.0):
@@ -71,6 +95,7 @@ class LLN(nn.Module):
         self.token = nn.Embedding(vocab_size, dim)
         self.position = nn.Embedding(max_seq_len, dim)
         self.blocks = nn.ModuleList([Block(dim, heads, dropout) for _ in range(layers)])
+        self.reasoning_state = ReasoningState(dim)
         self.norm = nn.LayerNorm(dim)
         self.lm_head = nn.Linear(dim, vocab_size, bias=False)
         self.apply(self._init_weights)
@@ -92,6 +117,17 @@ class LLN(nn.Module):
         x = self.token(input_ids) + self.position(pos)[None, :, :]
         for block in self.blocks:
             x = block(x)
+
+        # Extract a compact latent state specifically from <THINK>.
+        # The fixed token id 6 is <THINK> in the LLN dictionary.
+        think_id = 6
+        think_positions = input_ids.eq(think_id)
+        if think_positions.any():
+            batch_indices = torch.arange(x.size(0), device=x.device)
+            think_index = torch.argmax(think_positions.to(torch.int64), dim=1)
+            think_hidden = x[batch_indices, think_index]
+            x = self.reasoning_state(think_hidden, x)
+
         logits = self.lm_head(self.norm(x))
         loss = None
         if targets is not None:
