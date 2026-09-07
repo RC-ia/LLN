@@ -8,6 +8,12 @@ from lln.data import build_dataset, load_dictionary, make_batch
 from lln.model import LLN, parameter_count, parameter_size_mb
 
 
+# Dataset special-token IDs are fixed by lln.data.SPECIAL_TOKENS:
+# <PAD>=0, <BOS>=1, <EOS>=2, <UNK>=3, <USER>=4, <THINK>=5, <ANSWER>=6.
+THINK_TOKEN_ID = 5
+ANSWER_TOKEN_ID = 6
+
+
 def pick_dtype(name: str, device: torch.device):
     if name == "float32":
         return torch.float32
@@ -18,6 +24,39 @@ def pick_dtype(name: str, device: torch.device):
             raise RuntimeError("bfloat16 requested but this CPU/PyTorch build does not support it")
         return torch.bfloat16
     raise ValueError(name)
+
+
+def make_loss_weights(targets: torch.Tensor, think_weight: float, answer_weight: float) -> torch.Tensor:
+    """Build per-token loss weights from the target token stream.
+
+    User prompt tokens receive weight 0. Thinking receives a smaller weight,
+    while the final answer receives the strongest weight. EOS is treated as
+    part of the answer so the model also learns when to stop.
+    """
+    if think_weight < 0.0 or answer_weight <= 0.0:
+        raise ValueError("think_weight must be >= 0 and answer_weight must be > 0")
+
+    weights = torch.zeros_like(targets, dtype=torch.float32)
+    state = torch.zeros(targets.shape[0], dtype=torch.int8, device=targets.device)
+    # 0 = prompt/unscored, 1 = thinking, 2 = answer.
+
+    for pos in range(targets.shape[1]):
+        token = targets[:, pos]
+        think_mask = token.eq(THINK_TOKEN_ID)
+        answer_mask = token.eq(ANSWER_TOKEN_ID)
+        state = torch.where(think_mask, torch.ones_like(state), state)
+        state = torch.where(answer_mask, torch.full_like(state, 2), state)
+
+        weights[:, pos] = torch.where(
+            state.eq(1),
+            torch.full_like(weights[:, pos], think_weight),
+            torch.where(
+                state.eq(2),
+                torch.full_like(weights[:, pos], answer_weight),
+                torch.zeros_like(weights[:, pos]),
+            ),
+        )
+    return weights
 
 
 def main():
@@ -33,6 +72,8 @@ def main():
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--steps", type=int, default=2000, help="Additional steps to run")
     parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--think-weight", type=float, default=0.25, help="Relative loss weight for <THINK> content")
+    parser.add_argument("--answer-weight", type=float, default=1.0, help="Relative loss weight for <ANSWER> content")
     parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument("--save", default="lln_model.pt")
     parser.add_argument("--repeats", type=int, default=2000)
@@ -93,6 +134,7 @@ def main():
     print(f"device={device} dtype={dtype}")
     print(f"parameters={n_params:,} model_weight_size={mb:.1f} MB")
     print(f"vocab={len(word_to_id)} dataset_ids={len(data):,}")
+    print(f"loss_weights=prompt:0 think:{args.think_weight:g} answer:{args.answer_weight:g}")
     print(f"resume={resumed} starting_step={start_step}")
 
     scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda" and dtype == torch.float16))
@@ -104,11 +146,12 @@ def main():
     for local_step in range(1, args.steps + 1):
         global_step = start_step + local_step
         x, y = make_batch(data, args.batch_size, args.seq_len, device)
+        loss_weights = make_loss_weights(y, args.think_weight, args.answer_weight)
         optimizer.zero_grad(set_to_none=True)
 
         if scaler.is_enabled():
             with torch.autocast(device_type="cuda", dtype=dtype):
-                _, loss = model(x, y)
+                _, loss = model(x, y, loss_weights=loss_weights)
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -116,7 +159,7 @@ def main():
             scaler.update()
         else:
             with torch.autocast(device_type=device.type, dtype=dtype, enabled=(dtype != torch.float32)):
-                _, loss = model(x, y)
+                _, loss = model(x, y, loss_weights=loss_weights)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
@@ -137,6 +180,8 @@ def main():
             **model_cfg,
             "dictionary": str(args.dictionary),
             "dataset": str(args.dataset),
+            "think_weight": args.think_weight,
+            "answer_weight": args.answer_weight,
         },
     }, save_path)
     print(f"saved={save_path}")
