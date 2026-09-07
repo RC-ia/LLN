@@ -23,11 +23,17 @@ def normalize_text(text: str) -> str:
 def load_records(dataset_path: str | Path) -> list[tuple[str, str | None, str]]:
     dataset_path = Path(dataset_path)
     if dataset_path.suffix.lower() != ".json":
-        lines = [normalize_text(line) for line in dataset_path.read_text(encoding="utf-8").splitlines() if normalize_text(line)]
+        lines = [
+            normalize_text(line)
+            for line in dataset_path.read_text(encoding="utf-8").splitlines()
+            if normalize_text(line)
+        ]
         return [(line, None, "") for line in lines]
+
     raw = json.loads(dataset_path.read_text(encoding="utf-8"))
     if not isinstance(raw, list):
         raise ValueError("JSON dataset must contain a top-level list")
+
     records = []
     for item in raw:
         messages = item.get("messages", []) if isinstance(item, dict) else []
@@ -40,6 +46,7 @@ def load_records(dataset_path: str | Path) -> list[tuple[str, str | None, str]]:
         reasoning = normalize_text(assistant.get("reasoning_content", "")) or None
         if user_text and answer_text:
             records.append((user_text, reasoning, answer_text))
+
     if not records:
         raise ValueError(f"No valid user/assistant records found in {dataset_path}")
     return records
@@ -56,16 +63,23 @@ def record_texts(records: list[tuple[str, str | None, str]]) -> list[str]:
     return texts
 
 
-def create_dictionary_from_dataset(dataset_path: str | Path, dictionary_path: str | Path = DEFAULT_DICTIONARY):
+def create_dictionary_from_dataset(
+    dataset_path: str | Path,
+    dictionary_path: str | Path = DEFAULT_DICTIONARY,
+):
     records = load_records(dataset_path)
     words = " ".join(record_texts(records)).split()
     word_to_id = {token: i for i, token in enumerate(SPECIAL_TOKENS)}
     for word in sorted(set(words)):
         if word not in word_to_id:
             word_to_id[word] = len(word_to_id)
+
     dictionary_path = Path(dictionary_path)
     dictionary_path.parent.mkdir(parents=True, exist_ok=True)
-    dictionary_path.write_text(json.dumps(word_to_id, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    dictionary_path.write_text(
+        json.dumps(word_to_id, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
     return word_to_id
 
 
@@ -77,18 +91,27 @@ def load_dictionary(path: str | Path):
 
 
 def encode_text(text: str, word_to_id: dict[str, int]) -> list[int]:
-    return [word_to_id.get(word, word_to_id["<UNK>"]) for word in normalize_text(text).split()]
+    return [
+        word_to_id.get(word, word_to_id["<UNK>"])
+        for word in normalize_text(text).split()
+    ]
 
 
-def encode_record(record: tuple[str, str | None, str], word_to_id: dict[str, int]) -> tuple[list[int], list[int]]:
+def encode_record(
+    record: tuple[str, str | None, str],
+    word_to_id: dict[str, int],
+) -> tuple[list[int], list[int]]:
     user_text, reasoning, answer = record
     ids = [word_to_id["<BOS>"], word_to_id["<USER>"]]
     sections = [0, 0]
+
     user_ids = encode_text(user_text, word_to_id)
     ids += user_ids
     sections += [0] * len(user_ids)
+
     ids.append(word_to_id["</USER>"])
     sections.append(0)
+
     if reasoning:
         ids.append(word_to_id["<THINK>"])
         sections.append(1)
@@ -97,6 +120,7 @@ def encode_record(record: tuple[str, str | None, str], word_to_id: dict[str, int
         sections += [1] * len(think_ids)
         ids.append(word_to_id["</THINK>"])
         sections.append(1)
+
     ids.append(word_to_id["<ANSWER>"])
     sections.append(2)
     answer_ids = encode_text(answer, word_to_id)
@@ -110,35 +134,77 @@ def encode_record(record: tuple[str, str | None, str], word_to_id: dict[str, int
 
 
 def encode_prompt(text: str, word_to_id: dict[str, int]) -> list[int]:
-    return [word_to_id["<BOS>"], word_to_id["<USER>"], *encode_text(text, word_to_id), word_to_id["</USER>"], word_to_id["<THINK>"]]
+    return [
+        word_to_id["<BOS>"],
+        word_to_id["<USER>"],
+        *encode_text(text, word_to_id),
+        word_to_id["</USER>"],
+        word_to_id["<THINK>"],
+    ]
 
 
-def build_dataset(dataset_path: str | Path = DEFAULT_DATASET, dictionary_path: str | Path = DEFAULT_DICTIONARY,
-                  repeats: int = 1, seed: int = 1234, return_sections: bool = False):
+def build_dataset(
+    dataset_path: str | Path = DEFAULT_DATASET,
+    dictionary_path: str | Path = DEFAULT_DICTIONARY,
+    repeats: int = 1,
+    seed: int = 1234,
+    return_sections: bool = False,
+):
     records = load_records(dataset_path)
     word_to_id = create_dictionary_from_dataset(dataset_path, dictionary_path)
     rng = random.Random(seed)
     sequences = [encode_record(record, word_to_id) for record in records]
-    data, sections = [], []
-    for _ in range(max(1, repeats)):
-        seq, sec = rng.choice(sequences)
-        data.extend(seq)
-        sections.extend(sec)
-    return (data, sections) if return_sections else data
+
+    # Materialize repeated complete examples. A training sample is never
+    # assembled by concatenating unrelated records or cutting across them.
+    selected = [rng.choice(sequences) for _ in range(max(1, repeats))]
+    return selected
 
 
-def make_batch(data: list[int], batch_size: int, seq_len: int, device, sections: list[int] | None = None):
-    if len(data) <= seq_len + 1:
-        raise ValueError("Dataset is too small for the requested sequence length")
-    if sections is not None and len(sections) != len(data):
-        raise ValueError("sections must have the same length as data")
-    starts = torch.randint(0, len(data) - seq_len - 1, (batch_size,))
-    x = torch.stack([torch.tensor(data[i:i + seq_len], dtype=torch.long) for i in starts])
-    y = torch.stack([torch.tensor(data[i + 1:i + seq_len + 1], dtype=torch.long) for i in starts])
-    if sections is None:
-        return x.to(device), y.to(device)
-    batch_sections = torch.stack([torch.tensor(sections[i + 1:i + seq_len + 1], dtype=torch.float32) for i in starts])
-    return x.to(device), y.to(device), batch_sections.to(device)
+def make_batch(
+    data,
+    batch_size: int,
+    seq_len: int,
+    device,
+    sections=None,
+):
+    if not data:
+        raise ValueError("Dataset contains no training examples")
+    if sections is not None:
+        raise ValueError("sections argument is no longer used; pass complete records from build_dataset")
+
+    chosen = [random.choice(data) for _ in range(batch_size)]
+    x_rows, y_rows, w_rows = [], [], []
+    pad_id = 0
+
+    for ids, sec in chosen:
+        # Keep the beginning of the record and truncate only when a single
+        # example exceeds the model sequence length.
+        ids = ids[: seq_len + 1]
+        sec = sec[: seq_len + 1]
+        if len(ids) < 2:
+            continue
+
+        x_ids = ids[:-1]
+        y_ids = ids[1:]
+        y_sec = sec[1:]
+        pad_count = seq_len - len(x_ids)
+        if pad_count > 0:
+            x_ids = x_ids + [pad_id] * pad_count
+            y_ids = y_ids + [pad_id] * pad_count
+            y_sec = y_sec + [-1] * pad_count
+
+        x_rows.append(x_ids[:seq_len])
+        y_rows.append(y_ids[:seq_len])
+        w_rows.append(y_sec[:seq_len])
+
+    if not x_rows:
+        raise ValueError("No valid training examples")
+
+    x = torch.tensor(x_rows, dtype=torch.long, device=device)
+    y = torch.tensor(y_rows, dtype=torch.long, device=device)
+    batch_sections = torch.tensor(w_rows, dtype=torch.float32, device=device)
+    return x, y, batch_sections
 
 
 def decode_ids(ids: list[int], id_to_word: dict[int, str]) -> str:
@@ -147,7 +213,7 @@ def decode_ids(ids: list[int], id_to_word: dict[int, str]) -> str:
         word = id_to_word.get(int(idx), "<UNK>")
         if word in {"<BOS>", "<PAD>"}:
             continue
+        words.append(word)
         if word == "<EOS>":
             break
-        words.append(word)
     return " ".join(words)
