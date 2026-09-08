@@ -193,6 +193,9 @@ def main():
     )
 
     output = Path(args.output) if args.output else dictionary_path.with_suffix(".structure.json")
+    numeric_values = [
+        idx for idx in numeric_ids if parse_pure_number(id_to_token[idx]) is not None
+    ]
     metadata = {
         "version": 2,
         "method": "context_components_plus_dedicated_numeric_family",
@@ -200,9 +203,7 @@ def main():
         "top_neighbors": args.top_neighbors,
         "group_count": group_count,
         "numeric_family": {
-            "enabled": bool(numeric_values := [
-                idx for idx in numeric_ids if parse_pure_number(id_to_token[idx]) is not None
-            ]),
+            "enabled": bool(numeric_values),
             "classification": "pure_numeric_only",
             "ordering": "numeric_ascending_rank",
             "hybrid_tokens_are_excluded": True,
@@ -238,7 +239,7 @@ def main():
             key=lambda idx: (parse_pure_number(id_to_token[idx]), id_to_token[idx]),
         )[:20]
         preview = ", ".join(
-            f"{id_to_token[i]}:{position[i]}" for i in examples
+            f"{id_to_token[i]}:{positions[i]}" for i in examples
         )
         numeric_group_id = group_ids[examples[0]]
         print(f"numeric_group={numeric_group_id} size={len(numeric_ids)} {preview}")
@@ -249,7 +250,7 @@ def main():
             continue
         print(
             f"token={token!r} id={idx} group={group_ids[idx]} "
-            f"position={position[idx]} numeric={parse_pure_number(token) is not None}"
+            f"position={positions[idx]} numeric={parse_pure_number(token) is not None}"
         )
 
 
