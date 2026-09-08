@@ -1,8 +1,6 @@
 import argparse
 import math
 import random
-import time
-from pathlib import Path
 
 import torch
 
@@ -19,11 +17,7 @@ from lln.model import LLN, parameter_count, parameter_size_mb
 
 
 def pick_dtype(name):
-    return {
-        "float32": torch.float32,
-        "float16": torch.float16,
-        "bfloat16": torch.bfloat16,
-    }[name]
+    return {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}[name]
 
 
 def section_weights(sections, think_weight=0.25, answer_weight=1.0):
@@ -55,9 +49,9 @@ def grad_stats(model):
         if norm > 0.0:
             nonzero += 1
         max_abs = max(max_abs, float(g.abs().max().item()))
-        if len(rows) < 12:
-            rows.append((name, norm))
-    return math.sqrt(total_sq), nonzero, finite, max_abs, rows
+        rows.append((name, norm))
+    rows.sort(key=lambda item: item[1], reverse=True)
+    return math.sqrt(total_sq), nonzero, finite, max_abs, rows[:12]
 
 
 def parameter_delta(before, model):
@@ -74,48 +68,42 @@ def parameter_delta(before, model):
 
 
 def print_alignment(x, y, sections, id_to_word, limit=64):
+    print("\n=== TOKEN ALIGNMENT (example 0) ===")
     row_x = x[0].detach().cpu().tolist()
     row_y = y[0].detach().cpu().tolist()
     row_s = sections[0].detach().cpu().tolist()
-    print("\n=== TOKEN ALIGNMENT (example 0) ===")
     for i, (xi, yi, sec) in enumerate(zip(row_x, row_y, row_s)):
         if i >= limit:
             print(f"... ({len(row_x) - limit} more positions)")
             break
-        if yi == 0 and sec < 0:
+        if sec < 0:
             continue
-        sx = id_to_word.get(xi, "<UNK>")
-        sy = id_to_word.get(yi, "<UNK>")
+        sx = id_to_word.get(int(xi), "<UNK>")
+        sy = id_to_word.get(int(yi), "<UNK>")
         print(f"pos={i:4d} input={xi:5d} {sx!r:24s} -> target={yi:5d} {sy!r:24s} section={int(sec)}")
 
 
 def print_prediction(logits, y, sections, id_to_word, topk=5, limit=32):
-    print("\n=== FIRST-PASS PREDICTIONS (example 0) ===")
+    print("\n=== PREDICTIONS (example 0) ===")
     probs = torch.softmax(logits[0].float(), dim=-1)
-    for i in range(min(limit, logits.size(1))):
-        if sections[0, i].item() < 0 or y[0, i].item() == 0 and sections[0, i].item() < 0:
+    shown = 0
+    for i in range(logits.size(1)):
+        if sections[0, i].item() < 0:
             continue
         values, indices = torch.topk(probs[i], k=topk)
         target = int(y[0, i])
         best = int(indices[0])
         target_rank = int((probs[i] > probs[i, target]).sum().item()) + 1
-        choices = ", ".join(f"{id_to_word.get(int(t), '<UNK>')}:{float(v):.3f}" for v, t in zip(values, indices))
+        choices = ", ".join(
+            f"{id_to_word.get(int(t), '<UNK>')}:{float(v):.3f}" for v, t in zip(values, indices)
+        )
         print(
             f"pos={i:4d} target={id_to_word.get(target, '<UNK>')!r:20s} "
             f"pred={id_to_word.get(best, '<UNK>')!r:20s} rank={target_rank:4d} top={choices}"
         )
-
-
-def evaluate_batch(model, x, y, weights):
-    model.eval()
-    with torch.no_grad():
-        logits, loss = model(x, y, loss_weights=weights)
-        unweighted = model.lm_head.loss(model.norm(model.latent_memory(
-            model.norm(model.latent_memory( # unreachable in normal use; replaced below
-                torch.zeros_like(x, dtype=next(model.parameters()).dtype), x, model.THINK_TOKEN_ID, model.THINK_END_TOKEN_ID),
-                x, model.THINK_TOKEN_ID, model.THINK_END_TOKEN_ID)),
-            y)
-    return logits, loss, unweighted
+        shown += 1
+        if shown >= limit:
+            break
 
 
 def main():
@@ -137,7 +125,7 @@ def main():
     parser.add_argument("--examples", type=int, default=8)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--log-every", type=int, default=10)
-    parser.add_argument("--no-think-weight", action="store_true", help="Train think tokens with the same weight as answer tokens")
+    parser.add_argument("--no-think-weight", action="store_true")
     args = parser.parse_args()
 
     if args.examples < 1 or args.batch_size < 1 or args.steps < 1:
@@ -147,9 +135,10 @@ def main():
 
     random.seed(args.seed)
     torch.manual_seed(args.seed)
-    device = torch.device("cuda" if args.device == "auto" and torch.cuda.is_available() else args.device)
-    if args.device == "auto" and not torch.cuda.is_available():
-        device = torch.device("cpu")
+    if args.device == "auto":
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA requested but unavailable")
     dtype = pick_dtype(args.dtype)
@@ -160,15 +149,12 @@ def main():
     if not encoded:
         raise RuntimeError("No examples available")
 
-    # Force a fixed batch repeated forever. This isolates learnability from
-    # shuffling, epoch cursors, sampling and schedule effects.
     selected = encoded[: min(args.batch_size, len(encoded))]
     if len(selected) < args.batch_size:
         selected = (selected * ((args.batch_size + len(selected) - 1) // len(selected)))[: args.batch_size]
 
-    data_for_batch = selected
     x, y, sections = make_batch(
-        data_for_batch,
+        selected,
         args.batch_size,
         args.seq_len,
         device,
@@ -208,37 +194,34 @@ def main():
     model.eval()
     with torch.no_grad():
         logits0, loss0 = model(x, y, loss_weights=weights)
-        raw_loss0 = model.lm_head.loss(model.norm(model.blocks[-1](
-            model.norm(model.blocks[-1](model._embed(x)[0], model._embed(x)[1]), model._embed(x)[1]),
-            model._embed(x)[1]), y)
     print(f"\ninitial_weighted_loss={float(loss0):.6f}")
     print(f"initial_baseline_ln_vocab={math.log(len(word_to_id)):.6f}")
     print_prediction(logits0, y, sections, id_to_word)
 
     optimizer.zero_grad(set_to_none=True)
+    model.train()
     logits, loss = model(x, y, loss_weights=weights)
     loss.backward()
     grad_norm, nonzero, finite, grad_max, grad_rows = grad_stats(model)
     print("\n=== BACKWARD DIAGNOSTIC ===")
     print(f"loss={float(loss):.6f}")
     print(f"grad_global_norm={grad_norm:.6g} grad_nonzero_tensors={nonzero} grad_finite={finite} grad_max_abs={grad_max:.6g}")
-    print("largest-sampled-grad-norms:")
-    for name, norm in sorted(grad_rows, key=lambda item: item[1], reverse=True):
+    print("largest-gradient-tensors:")
+    for name, norm in grad_rows:
         print(f"  {name}: {norm:.6g}")
 
     initial_params = [p.detach().float().clone() for p in model.parameters()]
-    previous_loss = float(loss)
-    best_loss = previous_loss
+    best_loss = float(loss)
     print("\n=== OVERFIT LOOP ===")
     for step in range(1, args.steps + 1):
-        model.train()
         optimizer.zero_grad(set_to_none=True)
-        logits, loss = model(x, y, loss_weights=weights)
+        model.train()
+        _, loss = model(x, y, loss_weights=weights)
         if not torch.isfinite(loss):
             print(f"step={step:4d} loss=NONFINITE -- abort")
             break
         loss.backward()
-        grad_norm, nonzero, finite, grad_max, _ = grad_stats(model)
+        grad_norm, _, finite, grad_max, _ = grad_stats(model)
         if not finite:
             print(f"step={step:4d} loss={float(loss):.6f} nonfinite_grad -- abort")
             break
@@ -248,11 +231,10 @@ def main():
         if step == 1 or step % args.log_every == 0 or step == args.steps:
             delta, delta_max, changed = parameter_delta(initial_params, model)
             print(
-                f"step={step:4d} loss={value:.6f} "
-                f"delta_norm={delta:.6g} delta_max={delta_max:.6g} changed_values={changed:,} "
+                f"step={step:4d} loss={value:.6f} delta_norm={delta:.6g} "
+                f"delta_max={delta_max:.6g} changed_values={changed:,} "
                 f"grad_norm={grad_norm:.6g} grad_max={grad_max:.6g}"
             )
-            previous_loss = value
 
     model.eval()
     with torch.no_grad():
