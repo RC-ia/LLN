@@ -10,7 +10,7 @@ from lln.data import build_dataset, load_dictionary, make_batch
 from lln.model import LLN, parameter_count, parameter_size_mb
 
 
-LOSS_SCHEME_VERSION = 5
+LOSS_SCHEME_VERSION = 6
 ARCHITECTURE_VERSION = LLN.ARCHITECTURE_VERSION
 
 
@@ -78,6 +78,11 @@ def learning_rate_at(step: int, base_lr: float, min_lr: float, warmup_steps: int
     return min_lr + (base_lr - min_lr) * cosine
 
 
+def sync_cuda(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train LLN on bounded complete examples")
     parser.add_argument("--dataset", default="data/dataset.json")
@@ -95,12 +100,12 @@ def main():
     parser.add_argument("--warmup-steps", type=int, default=100)
     parser.add_argument("--think-weight", type=float, default=0.25)
     parser.add_argument("--answer-weight", type=float, default=1.0)
-    parser.add_argument("--recurrent-steps", type=int, default=2, help="Times the same transformer blocks are reused")
-    parser.add_argument("--output-clusters", type=int, default=120, help="Factorized softmax cluster count")
-    parser.add_argument("--memory-slots", type=int, default=4, help="Latent scratchpad slots")
+    parser.add_argument("--recurrent-steps", type=int, default=2)
+    parser.add_argument("--output-clusters", type=int, default=120)
+    parser.add_argument("--memory-slots", type=int, default=4)
     parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument("--save", default="lln_model.pt")
-    parser.add_argument("--repeats", type=int, default=2000, help="Examples per prepared epoch; defaults to one full dataset pass")
+    parser.add_argument("--repeats", type=int, default=2000)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--no-resume", action="store_true")
     args = parser.parse_args()
@@ -196,14 +201,9 @@ def main():
     if use_multi_gpu:
         if args.batch_size < gpu_count:
             raise ValueError(
-                f"--batch-size={args.batch_size} is too small for {gpu_count} GPUs; "
-                f"use at least --batch-size {gpu_count} to activate all GPUs"
+                f"--batch-size={args.batch_size} is too small for {gpu_count} GPUs; use at least --batch-size {gpu_count}"
             )
-        train_model = torch.nn.DataParallel(
-            model,
-            device_ids=list(range(gpu_count)),
-            output_device=0,
-        )
+        train_model = torch.nn.DataParallel(model, device_ids=list(range(gpu_count)), output_device=0)
 
     master_params = make_master_parameters(model)
     optimizer = torch.optim.AdamW(master_params, lr=args.lr, weight_decay=0.01)
@@ -235,7 +235,7 @@ def main():
     print(f"master_weight_size={master_mb:.1f} MB")
     print(f"vocab={len(word_to_id):,} records={len(data):,}")
     print(f"seq_len={args.seq_len} batch_size={args.batch_size}")
-    print(f"recurrent_steps={args.recurrent_steps} output_clusters={args.output_clusters} cluster_size={model.lm_head.cluster_size} memory_slots={args.memory_slots}")
+    print(f"recurrent_steps={args.recurrent_steps} output_clusters={args.output_clusters} memory_slots={args.memory_slots}")
     print(f"token_types={model_cfg['type_count']} dictionary_metadata={dictionary_meta.get('version', 1)}")
     print(f"loss_weights=prompt:0 think:{args.think_weight:g} answer:{args.answer_weight:g}")
     print("long_record_policy=preserve_prompt_and_answer_truncate_think")
@@ -245,9 +245,7 @@ def main():
     print("sampling_policy=shuffled_epoch_without_replacement")
     print(f"resume={resumed} starting_step={start_step} epoch={checkpoint_epoch} cursor={checkpoint_cursor}")
 
-    grad_scale = float(checkpoint_grad_scale) if checkpoint_grad_scale is not None else (
-        1024.0 if (device.type == "cuda" and dtype == torch.float16) else 1.0
-    )
+    grad_scale = float(checkpoint_grad_scale) if checkpoint_grad_scale is not None else (1024.0 if (device.type == "cuda" and dtype == torch.float16) else 1.0)
     if grad_scale <= 0.0:
         grad_scale = 1024.0 if (device.type == "cuda" and dtype == torch.float16) else 1.0
     print(f"grad_scale_start={grad_scale:g}")
@@ -265,6 +263,7 @@ def main():
     total_schedule_steps = max(1, start_step + args.steps)
     train_model.train()
     start = time.perf_counter()
+    sync_cuda(device)
     last_log = start
 
     for local_step in range(1, args.steps + 1):
@@ -286,11 +285,7 @@ def main():
         for group in optimizer.param_groups:
             group["lr"] = current_lr
 
-        with torch.autocast(
-            device_type=device.type,
-            dtype=dtype,
-            enabled=(dtype != torch.float32),
-        ):
+        with torch.autocast(device_type=device.type, dtype=dtype, enabled=(dtype != torch.float32)):
             _, loss = train_model(x, y, loss_weights=loss_weights)
             if use_multi_gpu:
                 loss = loss.mean()
@@ -337,6 +332,7 @@ def main():
             grad_scale = min(65536.0, grad_scale * 1.001)
 
         if local_step == 1 or local_step % args.log_every == 0 or local_step == args.steps:
+            sync_cuda(device)
             now = time.perf_counter()
             elapsed = max(now - last_log, 1e-9)
             window_steps = args.log_every if local_step > args.log_every else local_step
@@ -344,6 +340,7 @@ def main():
             print(f"step={global_step:6d} loss={loss.item():.6f} tok/s={tokens_s:,.0f} lr={current_lr:.6g} grad_scale={grad_scale:g}")
             last_log = now
 
+    sync_cuda(device)
     torch.save({
         "model": model.state_dict(),
         "master_params": [p.detach().cpu() for p in master_params],
@@ -368,7 +365,7 @@ def main():
             "warmup_steps": args.warmup_steps,
             "seed": args.seed,
             "sampling_policy": "shuffled_epoch_without_replacement",
-            "parallel_training": "DataParallel" if use_multi_gpu else "single_gpu",
+            "parallel_training": "DataParallel" if use_multi_gpu else "disabled",
             "gpu_count": gpu_count,
         },
     }, save_path)
