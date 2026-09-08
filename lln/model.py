@@ -1,4 +1,3 @@
-import math
 import torch
 from torch import nn
 
@@ -127,13 +126,7 @@ class LatentReasoningMemory(nn.Module):
         depth = (opened.cumsum(dim=1) - closed.cumsum(dim=1)).clamp(min=0)
         return depth.gt(0)
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        input_ids: torch.Tensor,
-        think_id: int,
-        think_end_id: int,
-    ) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, input_ids: torch.Tensor, think_id: int, think_end_id: int) -> torch.Tensor:
         active = self._active_think(input_ids, think_id, think_end_id)
         mask = active.to(x.dtype).unsqueeze(-1)
         counts = mask.cumsum(dim=1).clamp_min(1.0)
@@ -143,8 +136,6 @@ class LatentReasoningMemory(nn.Module):
         state = self.state_out(state_latent)
         state = state * torch.sigmoid(self.state_gate(cumulative))
 
-        # Keep the Linear input in the same dtype as the FP16/BF16 model weights.
-        # Only the softmax itself is evaluated in FP32 for numerical stability.
         write_logits = self.write_gate(cumulative)
         writes = torch.softmax(write_logits.float(), dim=-1).to(x.dtype)
         values = torch.tanh(self.write_value(cumulative))
@@ -163,84 +154,44 @@ class LatentReasoningMemory(nn.Module):
         return x + mask * gated
 
 
-class FactorizedLMHead(nn.Module):
-    """Predict token as cluster + local index, preserving fixed integer token IDs."""
+class TiedLMHead(nn.Module):
+    """Full-vocabulary softmax using the input token embedding as output weights."""
 
-    def __init__(self, dim: int, vocab_size: int, clusters: int = 120):
+    def __init__(self, embedding: nn.Embedding):
         super().__init__()
-        self.vocab_size = vocab_size
-        self.clusters = max(1, min(clusters, vocab_size))
-        self.cluster_size = math.ceil(vocab_size / self.clusters)
-        self.cluster_head = nn.Linear(dim, self.clusters, bias=False)
-        self.local_head = nn.Linear(dim, self.cluster_size, bias=False)
+        self.embedding = embedding
 
-        token_ids = torch.arange(vocab_size, dtype=torch.long)
-        cluster_ids = torch.div(token_ids, self.cluster_size, rounding_mode="floor")
-        local_ids = token_ids.remainder(self.cluster_size)
-        self.register_buffer("token_cluster", cluster_ids, persistent=True)
-        self.register_buffer("token_local", local_ids, persistent=True)
+    @property
+    def vocab_size(self) -> int:
+        return self.embedding.num_embeddings
 
-    def factorized_logits(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.cluster_head(x), self.local_head(x)
-
-    def full_logits(self, x: torch.Tensor) -> torch.Tensor:
-        cluster, local = self.factorized_logits(x)
-        combined = cluster.unsqueeze(-1) + local.unsqueeze(-2)
-        return combined.reshape(*combined.shape[:-2], -1)[..., :self.vocab_size]
-
-    def _local_log_z_per_cluster(self, local: torch.Tensor) -> torch.Tensor:
-        if self.clusters * self.cluster_size == self.vocab_size:
-            z = torch.logsumexp(local.float(), dim=-1)
-            return z.unsqueeze(-1).expand(*z.shape, self.clusters)
-        full_clusters = self.vocab_size // self.cluster_size
-        remainder = self.vocab_size - full_clusters * self.cluster_size
-        full_z = torch.logsumexp(local.float(), dim=-1)
-        parts = [full_z.unsqueeze(-1).expand(*full_z.shape, full_clusters)]
-        if remainder:
-            tail_z = torch.logsumexp(local[..., :remainder].float(), dim=-1)
-            parts.append(tail_z.unsqueeze(-1))
-        return torch.cat(parts, dim=-1)
+    def logits(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.matmul(x, self.embedding.weight.transpose(0, 1))
 
     def loss(self, x: torch.Tensor, targets: torch.Tensor, weights: torch.Tensor | None = None) -> torch.Tensor:
-        cluster, local = self.factorized_logits(x)
-        target_cluster = self.token_cluster[targets]
-        target_local = self.token_local[targets]
-        target_logits = cluster.gather(-1, target_cluster.unsqueeze(-1)).squeeze(-1)
-        target_logits = target_logits + local.gather(-1, target_local.unsqueeze(-1)).squeeze(-1)
-
-        local_log_z = self._local_log_z_per_cluster(local)
-        log_z = torch.logsumexp(cluster.float() + local_log_z, dim=-1)
-        token_loss = (log_z - target_logits.float()).clamp_min(0.0)
+        logits = self.logits(x)
+        flat_logits = logits.reshape(-1, self.vocab_size)
+        flat_targets = targets.reshape(-1)
+        token_loss = nn.functional.cross_entropy(flat_logits.float(), flat_targets, reduction="none")
         if weights is None:
             return token_loss.mean()
         flat_weights = weights.reshape(-1).to(token_loss.dtype)
-        flat_loss = token_loss.reshape(-1)
         weight_sum = flat_weights.sum()
         if weight_sum.item() <= 0.0:
             raise ValueError("loss_weights must contain at least one positive weight")
-        return (flat_loss * flat_weights).sum() / weight_sum
+        return (token_loss * flat_weights).sum() / weight_sum
 
 
 class LLN(nn.Module):
-    """LLN with recurrent depth, causal latent reasoning/memory and typed specialists."""
+    """LLN with recurrent depth, causal latent memory and typed specialists."""
 
-    ARCHITECTURE_VERSION = 3
+    ARCHITECTURE_VERSION = 4
     THINK_TOKEN_ID = 6
     THINK_END_TOKEN_ID = 7
 
-    def __init__(
-        self,
-        vocab_size: int,
-        dim: int = 512,
-        layers: int = 8,
-        heads: int = 8,
-        max_seq_len: int = 256,
-        dropout: float = 0.0,
-        recurrent_steps: int = 2,
-        output_clusters: int = 120,
-        memory_slots: int = 4,
-        type_count: int = 6,
-    ):
+    def __init__(self, vocab_size: int, dim: int = 512, layers: int = 8, heads: int = 8,
+                 max_seq_len: int = 256, dropout: float = 0.0, recurrent_steps: int = 2,
+                 output_clusters: int = 120, memory_slots: int = 4, type_count: int = 6):
         super().__init__()
         if recurrent_steps < 1:
             raise ValueError("recurrent_steps must be >= 1")
@@ -257,18 +208,16 @@ class LLN(nn.Module):
         self.token_type = nn.Embedding(type_count, dim)
         self.token_cluster = nn.Embedding(max(1, min(output_clusters, vocab_size)), dim)
         self.position = nn.Embedding(max_seq_len, dim)
-        self.blocks = nn.ModuleList([
-            Block(dim, heads, type_count, dropout) for _ in range(layers)
-        ])
+        self.blocks = nn.ModuleList([Block(dim, heads, type_count, dropout) for _ in range(layers)])
         self.latent_memory = LatentReasoningMemory(dim, memory_slots)
         self.norm = nn.LayerNorm(dim)
-        self.lm_head = FactorizedLMHead(dim, vocab_size, output_clusters)
+        self.lm_head = TiedLMHead(self.token)
         self.register_buffer("token_type_map", torch.zeros(vocab_size, dtype=torch.long), persistent=True)
         self.apply(self._init_weights)
 
     @property
     def cluster_size(self) -> int:
-        return self.lm_head.cluster_size
+        return self.lm_head.vocab_size
 
     def set_token_types(self, token_types: list[int] | torch.Tensor) -> None:
         values = torch.as_tensor(token_types, dtype=torch.long, device=self.token_type_map.device)
@@ -287,24 +236,16 @@ class LLN(nn.Module):
     def _embed(self, input_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         _, t = input_ids.shape
         token_types = self.token_type_map[input_ids]
-        clusters = torch.div(input_ids, self.cluster_size, rounding_mode="floor").clamp(
+        clusters = torch.div(input_ids, max(1, self.output_clusters), rounding_mode="floor").clamp(
             max=self.token_cluster.num_embeddings - 1
         )
         pos = torch.arange(t, device=input_ids.device)
-        x = (
-            self.token(input_ids)
-            + self.token_type(token_types)
-            + self.token_cluster(clusters)
-            + self.position(pos)[None, :, :]
-        )
+        x = (self.token(input_ids) + self.token_type(token_types) + self.token_cluster(clusters)
+             + self.position(pos)[None, :, :])
         return x, token_types
 
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        targets: torch.Tensor | None = None,
-        loss_weights: torch.Tensor | None = None,
-    ):
+    def forward(self, input_ids: torch.Tensor, targets: torch.Tensor | None = None,
+                loss_weights: torch.Tensor | None = None):
         _, t = input_ids.shape
         if t > self.max_seq_len:
             raise ValueError(f"sequence length {t} > max_seq_len {self.max_seq_len}")
@@ -313,24 +254,14 @@ class LLN(nn.Module):
             for block in self.blocks:
                 x = block(x, token_types)
             x = self.latent_memory(x, input_ids, self.THINK_TOKEN_ID, self.THINK_END_TOKEN_ID)
-
         x = self.norm(x)
-        logits = self.lm_head.full_logits(x)
-        loss = None
-        if targets is not None:
-            loss = self.lm_head.loss(x, targets, weights=loss_weights)
+        logits = self.lm_head.logits(x)
+        loss = None if targets is None else self.lm_head.loss(x, targets, weights=loss_weights)
         return logits, loss
 
     @torch.no_grad()
-    def generate(
-        self,
-        input_ids: torch.Tensor,
-        max_new_tokens: int = 128,
-        temperature: float = 1.0,
-        repetition_penalty: float = 1.15,
-        no_repeat_ngram_size: int = 3,
-        stop_ids=None,
-    ):
+    def generate(self, input_ids: torch.Tensor, max_new_tokens: int = 128, temperature: float = 1.0,
+                 repetition_penalty: float = 1.15, no_repeat_ngram_size: int = 3, stop_ids=None):
         self.eval()
         if temperature <= 0.0:
             raise ValueError("temperature must be > 0")
@@ -339,7 +270,6 @@ class LLN(nn.Module):
         if no_repeat_ngram_size < 0:
             raise ValueError("no_repeat_ngram_size must be >= 0")
         stop_ids = set(stop_ids or {2})
-
         for _ in range(max_new_tokens):
             x = input_ids[:, -self.max_seq_len:]
             logits, _ = self(x)
@@ -349,9 +279,7 @@ class LLN(nn.Module):
                     seen = set(int(token) for token in input_ids[batch_idx].tolist())
                     for token_id in seen:
                         value = next_logits[batch_idx, token_id]
-                        next_logits[batch_idx, token_id] = (
-                            value * repetition_penalty if value < 0 else value / repetition_penalty
-                        )
+                        next_logits[batch_idx, token_id] = value * repetition_penalty if value < 0 else value / repetition_penalty
             if no_repeat_ngram_size >= 2 and input_ids.size(1) >= no_repeat_ngram_size - 1:
                 for batch_idx in range(input_ids.size(0)):
                     tokens = input_ids[batch_idx].tolist()
