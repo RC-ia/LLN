@@ -3,9 +3,25 @@ import json
 import math
 import re
 from collections import Counter, defaultdict
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from lln.data import SPECIAL_TOKENS, classify_token, load_records, normalize_text
+
+
+# Only tokens that are entirely numeric are treated as members of the numeric
+# structural family. Punctuation-attached forms such as "2.", "3:", "1,"
+# remain normal lexical tokens and must not contaminate numeric ordering.
+PURE_NUMBER_RE = re.compile(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)")
+
+
+def parse_pure_number(token):
+    if not PURE_NUMBER_RE.fullmatch(token):
+        return None
+    try:
+        return Decimal(token)
+    except InvalidOperation:
+        return None
 
 
 def tokenized_records(dataset_path):
@@ -20,8 +36,11 @@ def tokenized_records(dataset_path):
     return texts
 
 
-def build_context_counts(token_sequences, vocab):
+def build_context_counts(token_sequences, vocab, blocked_ids=None):
     # Sparse co-occurrence graph. Window 4 keeps this inexpensive enough for a small dataset.
+    # Numeric tokens are excluded from this graph so semantic grouping cannot
+    # destroy the dedicated numeric structural family.
+    blocked_ids = blocked_ids or set()
     neighbors = defaultdict(Counter)
     frequency = Counter()
     window = 4
@@ -29,12 +48,16 @@ def build_context_counts(token_sequences, vocab):
         ids = [vocab.get(tok, vocab["<UNK>"]) for tok in seq]
         for i, a in enumerate(ids):
             frequency[a] += 1
+            if a in blocked_ids:
+                continue
             lo = max(0, i - window)
             hi = min(len(ids), i + window + 1)
             for j in range(lo, hi):
                 if i == j:
                     continue
                 b = ids[j]
+                if b in blocked_ids:
+                    continue
                 neighbors[a][b] += 1
     return neighbors, frequency
 
@@ -50,7 +73,8 @@ def cosine_sparse(a, b):
     return dot / (na * nb) if na and nb else 0.0
 
 
-def build_groups(neighbors, frequency, vocab_size, min_similarity, top_neighbors):
+def build_groups(neighbors, vocab_size, min_similarity, top_neighbors, excluded_ids=None):
+    excluded_ids = excluded_ids or set()
     parent = list(range(vocab_size))
 
     def find(x):
@@ -66,7 +90,9 @@ def build_groups(neighbors, frequency, vocab_size, min_similarity, top_neighbors
 
     ranked = []
     for token_id, row in neighbors.items():
-        candidates = [n for n, _ in row.most_common(top_neighbors)]
+        if token_id in excluded_ids:
+            continue
+        candidates = [n for n, _ in row.most_common(top_neighbors) if n not in excluded_ids]
         candidates = sorted(candidates, key=lambda n: cosine_sparse(row, neighbors.get(n, {})), reverse=True)
         for n in candidates[:top_neighbors]:
             sim = cosine_sparse(row, neighbors.get(n, {}))
@@ -81,39 +107,41 @@ def build_groups(neighbors, frequency, vocab_size, min_similarity, top_neighbors
 
     groups = defaultdict(list)
     for token_id in range(vocab_size):
-        groups[find(token_id)].append(token_id)
+        if token_id not in excluded_ids:
+            groups[find(token_id)].append(token_id)
 
     return list(groups.values())
 
 
-def assign_positions(groups, id_to_token, token_frequency):
+def assign_positions(groups, id_to_token, token_frequency, numeric_ids):
     group_id = [-1] * len(id_to_token)
     position = [0] * len(id_to_token)
 
     next_group = 0
-    for members in sorted(groups, key=lambda g: (-len(g), min(g))):
-        # Numeric families get true numeric ordering. Everything else uses a
-        # deterministic frequency/lexical ordering, which is only a hypothesis
-        # and is intentionally recorded as such in the metadata.
-        tokens = [id_to_token[i] for i in members]
-        numeric = []
-        for idx, token in zip(members, tokens):
-            raw = token.replace(",", ".")
-            try:
-                if re.fullmatch(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)", raw):
-                    numeric.append((float(raw), idx))
-            except ValueError:
-                pass
 
-        if len(numeric) == len(members) and numeric:
-            ordered = [idx for _, idx in sorted(numeric)]
-            position_rule = "numeric_ascending"
-        else:
-            ordered = sorted(
-                members,
-                key=lambda idx: (-token_frequency.get(idx, 0), id_to_token[idx]),
-            )
-            position_rule = "frequency_desc_then_lexical"
+    # One dedicated structural numeric family. Position is the rank among the
+    # numeric values observed in the dictionary, so sparse values still receive
+    # compact positions: 1 -> 0, 2 -> 1, 5 -> 2, ...
+    numeric_values = []
+    for idx in numeric_ids:
+        value = parse_pure_number(id_to_token[idx])
+        if value is not None:
+            numeric_values.append((value, idx))
+    numeric_values.sort(key=lambda item: (item[0], id_to_token[item[1]]))
+
+    if numeric_values:
+        for pos, (_, idx) in enumerate(numeric_values):
+            group_id[idx] = next_group
+            position[idx] = pos
+        next_group += 1
+
+    for members in sorted(groups, key=lambda g: (-len(g), min(g))):
+        # Non-numeric families use deterministic frequency/lexical ordering.
+        # This is a structural hypothesis, not a claim of semantic ordering.
+        ordered = sorted(
+            members,
+            key=lambda idx: (-token_frequency.get(idx, 0), id_to_token[idx]),
+        )
 
         for pos, idx in enumerate(ordered):
             group_id[idx] = next_group
@@ -139,26 +167,49 @@ def main():
     for token, idx in vocab.items():
         id_to_token[idx] = token
 
+    numeric_ids = {
+        idx for idx, token in enumerate(id_to_token)
+        if parse_pure_number(token) is not None
+    }
+
     sequences = tokenized_records(args.dataset)
-    neighbors, frequency = build_context_counts(sequences, vocab)
+    neighbors, frequency = build_context_counts(
+        sequences,
+        vocab,
+        blocked_ids=numeric_ids,
+    )
     groups = build_groups(
         neighbors,
-        frequency,
         len(vocab),
         min_similarity=args.min_similarity,
         top_neighbors=args.top_neighbors,
+        excluded_ids=numeric_ids,
     )
-    group_ids, positions, group_count = assign_positions(groups, id_to_token, frequency)
+    group_ids, positions, group_count = assign_positions(
+        groups,
+        id_to_token,
+        frequency,
+        numeric_ids,
+    )
 
     output = Path(args.output) if args.output else dictionary_path.with_suffix(".structure.json")
     metadata = {
-        "version": 1,
-        "method": "sparse_context_similarity_components",
+        "version": 2,
+        "method": "context_components_plus_dedicated_numeric_family",
         "min_similarity": args.min_similarity,
         "top_neighbors": args.top_neighbors,
         "group_count": group_count,
+        "numeric_family": {
+            "enabled": bool(numeric_values := [
+                idx for idx in numeric_ids if parse_pure_number(id_to_token[idx]) is not None
+            ]),
+            "classification": "pure_numeric_only",
+            "ordering": "numeric_ascending_rank",
+            "hybrid_tokens_are_excluded": True,
+            "member_count": len(numeric_values),
+        },
         "position_rules": {
-            "numeric": "numeric_ascending",
+            "numeric": "numeric_ascending_rank",
             "other": "frequency_desc_then_lexical",
         },
         "token_groups": group_ids,
@@ -173,24 +224,33 @@ def main():
     print(f"vocab={len(vocab):,}")
     print(f"groups={group_count:,}")
     print(f"output={output}")
-    print("method=sparse_context_similarity_components")
-    print("numeric_position=numeric_ascending")
+    print("method=context_components_plus_dedicated_numeric_family")
+    print(f"numeric_tokens={len(numeric_ids):,}")
+    print("numeric_classification=pure_numeric_only")
+    print("numeric_position=numeric_ascending_rank")
+    print("hybrid_tokens_excluded=true")
     print("other_position=frequency_desc_then_lexical")
 
-    # Show a few useful numeric families when they exist.
-    number_type = {idx for idx, tok in enumerate(id_to_token) if classify_token(tok) == 2}
-    numeric_groups = defaultdict(list)
-    for idx in number_type:
-        numeric_groups[group_ids[idx]].append(idx)
-    examples = 0
-    for gid, members in sorted(numeric_groups.items(), key=lambda kv: -len(kv[1])):
-        if len(members) >= 2:
-            members = sorted(members, key=lambda idx: positions[idx])
-            preview = ", ".join(f"{id_to_token[i]}:{positions[i]}" for i in members[:12])
-            print(f"numeric_group={gid} size={len(members)} {preview}")
-            examples += 1
-            if examples >= 5:
-                break
+    # Show a few useful numeric entries. The family is global by design.
+    if numeric_ids:
+        examples = sorted(
+            numeric_ids,
+            key=lambda idx: (parse_pure_number(id_to_token[idx]), id_to_token[idx]),
+        )[:20]
+        preview = ", ".join(
+            f"{id_to_token[i]}:{position[i]}" for i in examples
+        )
+        numeric_group_id = group_ids[examples[0]]
+        print(f"numeric_group={numeric_group_id} size={len(numeric_ids)} {preview}")
+
+    for token in ("1", "2", "3", "5.0", "10.0", "50.0", "2.", "3:", "1,"):
+        idx = vocab.get(token)
+        if idx is None:
+            continue
+        print(
+            f"token={token!r} id={idx} group={group_ids[idx]} "
+            f"position={position[idx]} numeric={parse_pure_number(token) is not None}"
+        )
 
 
 if __name__ == "__main__":
