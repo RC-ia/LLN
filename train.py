@@ -190,6 +190,21 @@ def main():
     if checkpoint is not None:
         model.load_state_dict(checkpoint["model"])
 
+    gpu_count = torch.cuda.device_count() if device.type == "cuda" else 0
+    use_multi_gpu = device.type == "cuda" and gpu_count > 1
+    train_model = model
+    if use_multi_gpu:
+        if args.batch_size < gpu_count:
+            raise ValueError(
+                f"--batch-size={args.batch_size} is too small for {gpu_count} GPUs; "
+                f"use at least --batch-size {gpu_count} to activate all GPUs"
+            )
+        train_model = torch.nn.DataParallel(
+            model,
+            device_ids=list(range(gpu_count)),
+            output_device=0,
+        )
+
     master_params = make_master_parameters(model)
     optimizer = torch.optim.AdamW(master_params, lr=args.lr, weight_decay=0.01)
     if checkpoint is not None:
@@ -211,6 +226,11 @@ def main():
     mb = parameter_size_mb(model, torch.tensor([], dtype=dtype).element_size())
     master_mb = parameter_size_mb(model, 4)
     print(f"device={device} dtype={dtype}")
+    if use_multi_gpu:
+        print(f"parallel_training=DataParallel gpus={gpu_count} device_ids={list(range(gpu_count))}")
+        print("parallel_batch_policy=each GPU receives approximately batch_size/gpu_count examples")
+    else:
+        print("parallel_training=disabled")
     print(f"parameters={n_params:,} model_weight_size={mb:.1f} MB")
     print(f"master_weight_size={master_mb:.1f} MB")
     print(f"vocab={len(word_to_id):,} records={len(data):,}")
@@ -243,7 +263,7 @@ def main():
         random.Random(args.seed + epoch).shuffle(order)
 
     total_schedule_steps = max(1, start_step + args.steps)
-    model.train()
+    train_model.train()
     start = time.perf_counter()
     last_log = start
 
@@ -271,7 +291,9 @@ def main():
             dtype=dtype,
             enabled=(dtype != torch.float32),
         ):
-            _, loss = model(x, y, loss_weights=loss_weights)
+            _, loss = train_model(x, y, loss_weights=loss_weights)
+            if use_multi_gpu:
+                loss = loss.mean()
 
         if grad_scale != 1.0:
             (loss * grad_scale).backward()
@@ -346,6 +368,8 @@ def main():
             "warmup_steps": args.warmup_steps,
             "seed": args.seed,
             "sampling_policy": "shuffled_epoch_without_replacement",
+            "parallel_training": "DataParallel" if use_multi_gpu else "single_gpu",
+            "gpu_count": gpu_count,
         },
     }, save_path)
     print(f"saved={save_path}")
