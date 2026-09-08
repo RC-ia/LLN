@@ -49,8 +49,6 @@ class MLP(nn.Module):
 
 
 class LowRankSpecialist(nn.Module):
-    """Small type-specialist adapter that adds domain-specific computation."""
-
     def __init__(self, dim: int, rank: int):
         super().__init__()
         self.down = nn.Linear(dim, rank, bias=False)
@@ -104,8 +102,6 @@ class Block(nn.Module):
 
 
 class LatentReasoningMemory(nn.Module):
-    """Causal latent state + multi-slot scratchpad derived only from prior THINK tokens."""
-
     def __init__(self, dim: int, slots: int = 4):
         super().__init__()
         state_dim = max(16, dim // 8)
@@ -131,32 +127,26 @@ class LatentReasoningMemory(nn.Module):
         mask = active.to(x.dtype).unsqueeze(-1)
         counts = mask.cumsum(dim=1).clamp_min(1.0)
         cumulative = (x * mask).cumsum(dim=1) / counts
-
         state_latent = torch.tanh(self.state_in(cumulative))
         state = self.state_out(state_latent)
         state = state * torch.sigmoid(self.state_gate(cumulative))
-
         write_logits = self.write_gate(cumulative)
         writes = torch.softmax(write_logits.float(), dim=-1).to(x.dtype)
         values = torch.tanh(self.write_value(cumulative))
         memory = (writes.unsqueeze(-1) * values.unsqueeze(2)).cumsum(dim=1)
         write_norm = writes.cumsum(dim=1).unsqueeze(-1).clamp_min(1e-4)
         memory = memory / write_norm
-
         query = self.query(cumulative)
         read_weights = torch.softmax(
             torch.einsum("btd,sd->bts", query.float(), self.slot_keys.float()), dim=-1
         ).to(x.dtype)
         read = torch.einsum("bts,btsd->btd", read_weights, memory)
-
         latent = state + read
         gated = latent * torch.sigmoid(self.memory_gate(cumulative))
         return x + mask * gated
 
 
 class TiedLMHead(nn.Module):
-    """Full-vocabulary softmax using the input token embedding as output weights."""
-
     def __init__(self, embedding: nn.Embedding):
         super().__init__()
         self.embedding = embedding
@@ -183,8 +173,6 @@ class TiedLMHead(nn.Module):
 
 
 class LLN(nn.Module):
-    """LLN with recurrent depth, causal latent memory and typed specialists."""
-
     ARCHITECTURE_VERSION = 4
     THINK_TOKEN_ID = 6
     THINK_END_TOKEN_ID = 7
@@ -261,7 +249,10 @@ class LLN(nn.Module):
 
     @torch.no_grad()
     def generate(self, input_ids: torch.Tensor, max_new_tokens: int = 128, temperature: float = 1.0,
-                 repetition_penalty: float = 1.15, no_repeat_ngram_size: int = 3, stop_ids=None):
+                 repetition_penalty: float = 1.15, no_repeat_ngram_size: int = 3,
+                 repetition_window: int = 64, frequency_penalty: float = 0.08,
+                 presence_penalty: float = 0.20, hard_repeat_threshold: int = 6,
+                 stop_ids=None):
         self.eval()
         if temperature <= 0.0:
             raise ValueError("temperature must be > 0")
@@ -269,19 +260,48 @@ class LLN(nn.Module):
             raise ValueError("repetition_penalty must be >= 1.0")
         if no_repeat_ngram_size < 0:
             raise ValueError("no_repeat_ngram_size must be >= 0")
+        if repetition_window < 0:
+            raise ValueError("repetition_window must be >= 0")
+        if frequency_penalty < 0.0 or presence_penalty < 0.0:
+            raise ValueError("frequency_penalty and presence_penalty must be >= 0")
+        if hard_repeat_threshold < 2:
+            raise ValueError("hard_repeat_threshold must be >= 2")
         stop_ids = set(stop_ids or {2})
+
         for _ in range(max_new_tokens):
             x = input_ids[:, -self.max_seq_len:]
             logits, _ = self(x)
             next_logits = logits[:, -1, :].float().clone()
-            if repetition_penalty > 1.0:
-                for batch_idx in range(input_ids.size(0)):
-                    seen = set(int(token) for token in input_ids[batch_idx].tolist())
-                    for token_id in seen:
+
+            for batch_idx in range(input_ids.size(0)):
+                recent = input_ids[batch_idx, -repetition_window:] if repetition_window > 0 else input_ids[batch_idx]
+                recent_list = [int(token) for token in recent.tolist()]
+                counts = {}
+                for token_id in recent_list:
+                    counts[token_id] = counts.get(token_id, 0) + 1
+
+                if repetition_penalty > 1.0:
+                    for token_id in counts:
                         value = next_logits[batch_idx, token_id]
-                        next_logits[batch_idx, token_id] = value * repetition_penalty if value < 0 else value / repetition_penalty
-            if no_repeat_ngram_size >= 2 and input_ids.size(1) >= no_repeat_ngram_size - 1:
-                for batch_idx in range(input_ids.size(0)):
+                        next_logits[batch_idx, token_id] = (
+                            value * repetition_penalty if value < 0 else value / repetition_penalty
+                        )
+
+                if presence_penalty > 0.0:
+                    for token_id in counts:
+                        next_logits[batch_idx, token_id] -= presence_penalty
+
+                if frequency_penalty > 0.0:
+                    for token_id, count in counts.items():
+                        next_logits[batch_idx, token_id] -= frequency_penalty * count
+
+                # Hard block tokens that have become pathological repetitions.
+                if hard_repeat_threshold > 0:
+                    blocked = [token_id for token_id, count in counts.items() if count >= hard_repeat_threshold]
+                    if blocked:
+                        next_logits[batch_idx, blocked] = float("-inf")
+
+                if no_repeat_ngram_size >= 2 and input_ids.size(1) >= no_repeat_ngram_size - 1:
                     tokens = input_ids[batch_idx].tolist()
                     prefix = tuple(tokens[-(no_repeat_ngram_size - 1):])
                     banned = set()
@@ -291,6 +311,7 @@ class LLN(nn.Module):
                             banned.add(ngram[-1])
                     if banned:
                         next_logits[batch_idx, list(banned)] = float("-inf")
+
             if temperature == 1.0:
                 next_id = torch.argmax(next_logits, dim=-1, keepdim=True)
             else:
