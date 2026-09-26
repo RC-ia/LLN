@@ -230,8 +230,9 @@ class LatentReasoningMemory(nn.Module):
         output = x + mask * gated
 
         state_out = {
-            "active": active[:, -1],
-            "count": counts[:, -1:].detach(),
+            # Keep cached state rank-stable: [B], [B,D], [B,S,D], [B,S].
+            "active": active[:, -1].detach(),
+            "count": counts[:, -1, 0].detach(),
             "cumulative": cumulative[:, -1].detach(),
             "write_accum": write_accum[:, -1].detach(),
             "write_norm": write_norm[:, -1].detach(),
@@ -246,16 +247,58 @@ class LatentReasoningMemory(nn.Module):
         think_id: int,
         think_end_id: int,
     ):
-        opened = input_ids.eq(think_id).squeeze(-1)
-        closed = input_ids.eq(think_end_id).squeeze(-1)
-        token_active = (state["active"] | opened) & ~closed
+        if x.ndim != 3 or x.size(1) != 1:
+            raise ValueError(f"LatentReasoningMemory.step expects x [batch, 1, dim], got {tuple(x.shape)}")
+        if input_ids.ndim != 2 or input_ids.size(1) != 1:
+            raise ValueError(
+                f"LatentReasoningMemory.step expects input_ids [batch, 1], got {tuple(input_ids.shape)}"
+            )
 
+        batch_size = x.size(0)
+        opened = input_ids.eq(think_id)[:, 0]
+        closed = input_ids.eq(think_end_id)[:, 0]
+
+        active = state["active"]
+        if active.ndim != 1:
+            active = active.reshape(batch_size)
+        token_active = (active | opened) & ~closed
+
+        # Normalize cached state ranks so old/inadvertently unsqueezed states
+        # cannot turn the memory tensor into [B, 1, S, D].
         previous_count = state["count"]
-        new_count = previous_count + token_active.to(x.dtype).unsqueeze(-1)
+        if previous_count.ndim == 2:
+            previous_count = previous_count[:, 0]
+        previous_count = previous_count.reshape(batch_size)
+
         cumulative = state["cumulative"]
+        if cumulative.ndim == 3:
+            cumulative = cumulative[:, -1]
+        if cumulative.ndim != 2:
+            raise ValueError(
+                f"LatentReasoningMemory.step expected cumulative [batch, dim], got {tuple(cumulative.shape)}"
+            )
+
+        write_accum_state = state["write_accum"]
+        if write_accum_state.ndim == 4:
+            write_accum_state = write_accum_state[:, -1]
+        if write_accum_state.ndim != 3:
+            raise ValueError(
+                "LatentReasoningMemory.step expected write_accum [batch, slots, dim], "
+                f"got {tuple(write_accum_state.shape)}"
+            )
+
+        write_norm_state = state["write_norm"]
+        if write_norm_state.ndim == 3:
+            write_norm_state = write_norm_state[:, -1]
+        if write_norm_state.ndim != 2:
+            raise ValueError(
+                f"LatentReasoningMemory.step expected write_norm [batch, slots], got {tuple(write_norm_state.shape)}"
+            )
+
+        new_count = previous_count + token_active.to(x.dtype)
         updated_cumulative = (
-            previous_count * cumulative + x.squeeze(1)
-        ) / new_count.clamp_min(1.0)
+            previous_count.unsqueeze(-1) * cumulative + x[:, 0, :]
+        ) / new_count.clamp_min(1.0).unsqueeze(-1)
         cumulative = torch.where(
             token_active.unsqueeze(-1),
             updated_cumulative,
@@ -270,13 +313,13 @@ class LatentReasoningMemory(nn.Module):
         writes = torch.softmax(write_logits.float(), dim=-1).to(x.dtype)
         writes = writes * token_active.to(x.dtype).unsqueeze(-1)
         values = torch.tanh(self.write_value(cumulative))
-        write_accum = state["write_accum"] + writes.unsqueeze(-1) * values.unsqueeze(1)
-        write_norm = state["write_norm"] + writes
+        write_accum = write_accum_state + writes.unsqueeze(-1) * values.unsqueeze(1)
+        write_norm = write_norm_state + writes
         memory = write_accum / write_norm.unsqueeze(-1).clamp_min(1e-4)
 
         query = self.query(cumulative)
         read_weights = torch.softmax(
-            torch.einsum("bd,sd->bs", query.squeeze(1).float(), self.slot_keys.float()), dim=-1
+            torch.einsum("bd,sd->bs", query.float(), self.slot_keys.float()), dim=-1
         ).to(x.dtype)
         read = torch.einsum("bs,bsd->bd", read_weights, memory).unsqueeze(1)
 
