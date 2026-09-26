@@ -70,7 +70,16 @@ def copy_grads_to_master(model: torch.nn.Module, master_params) -> None:
                 master_param.grad.copy_(grad)
 
 
-def learning_rate_at(step: int, base_lr: float, min_lr: float, warmup_steps: int, total_schedule_steps: int) -> float:
+def learning_rate_at(
+    step: int,
+    base_lr: float,
+    min_lr: float,
+    warmup_steps: int,
+    total_schedule_steps: int,
+    schedule: str,
+) -> float:
+    if schedule == "constant":
+        return base_lr
     if warmup_steps > 0 and step <= warmup_steps:
         frac = step / float(warmup_steps)
         return base_lr * max(frac, 1e-3)
@@ -99,6 +108,12 @@ def main():
     parser.add_argument("--steps", type=int, default=2000, help="Additional steps to run")
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--min-lr", type=float, default=3e-5)
+    parser.add_argument(
+        "--lr-schedule",
+        choices=["constant", "warmup_cosine"],
+        default="constant",
+        help="Learning-rate schedule. constant keeps --lr unchanged for the whole run.",
+    )
     parser.add_argument("--warmup-steps", type=int, default=100)
     parser.add_argument("--think-weight", type=float, default=0.25)
     parser.add_argument("--answer-weight", type=float, default=1.0)
@@ -247,7 +262,10 @@ def main():
     print("long_record_policy=preserve_prompt_and_answer_truncate_think")
     print("optimizer=AdamW fp32_master_params")
     print(f"architecture_version={ARCHITECTURE_VERSION}")
-    print(f"training_schedule=warmup:{args.warmup_steps} max_lr:{args.lr:g} min_lr:{args.min_lr:g}")
+    if args.lr_schedule == "constant":
+        print(f"training_schedule=constant lr:{args.lr:g}")
+    else:
+        print(f"training_schedule=warmup_cosine warmup:{args.warmup_steps} max_lr:{args.lr:g} min_lr:{args.min_lr:g}")
     print("sampling_policy=shuffled_epoch_without_replacement")
     print(f"resume={resumed} starting_step={start_step} epoch={checkpoint_epoch} cursor={checkpoint_cursor}")
 
@@ -293,7 +311,14 @@ def main():
         optimizer.zero_grad(set_to_none=True)
         model.zero_grad(set_to_none=True)
 
-        current_lr = learning_rate_at(global_step, args.lr, args.min_lr, args.warmup_steps, total_schedule_steps)
+        current_lr = learning_rate_at(
+            global_step,
+            args.lr,
+            args.min_lr,
+            args.warmup_steps,
+            total_schedule_steps,
+            args.lr_schedule,
+        )
         for group in optimizer.param_groups:
             group["lr"] = current_lr
 
@@ -372,7 +397,7 @@ def main():
             "answer_weight": args.answer_weight,
             "dtype": str(dtype),
             "optimizer": "AdamW_fp32_master",
-            "schedule": "warmup_cosine",
+            "schedule": args.lr_schedule,
             "base_lr": args.lr,
             "min_lr": args.min_lr,
             "warmup_steps": args.warmup_steps,
