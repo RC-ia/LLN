@@ -6,7 +6,7 @@ from pathlib import Path
 
 import torch
 
-from lln.data import build_dataset, load_dictionary, make_batch
+from lln.data import build_dataset, dictionary_fingerprint, load_dictionary, make_batch
 from lln.model import LLN, parameter_count, parameter_size_mb
 
 
@@ -18,6 +18,8 @@ def pick_dtype(name: str, device: torch.device):
     if name == "float32":
         return torch.float32
     if name == "float16":
+        if device.type == "cpu":
+            raise RuntimeError("float16 training requires CUDA; use --dtype float32 on CPU")
         return torch.float16
     if name == "bfloat16":
         if device.type == "cpu" and not torch.cuda.is_bf16_supported():
@@ -145,6 +147,7 @@ def main():
         return_sections=True,
     )
     word_to_id, _, token_types, dictionary_meta = load_dictionary(args.dictionary, with_metadata=True)
+    dictionary_hash = dictionary_fingerprint(word_to_id)
 
     model_cfg = {
         "vocab_size": len(word_to_id),
@@ -173,6 +176,9 @@ def main():
         comparable = {k: saved_cfg.get(k) for k in model_cfg}
         if comparable != model_cfg:
             print("checkpoint architecture/vocabulary or sequence length differs; starting a new model")
+            checkpoint = None
+        elif saved_cfg.get("dictionary_fingerprint") != dictionary_hash:
+            print("checkpoint dictionary mapping differs from current dictionary; starting a new model")
             checkpoint = None
         elif saved_cfg.get("architecture_version") != ARCHITECTURE_VERSION:
             print("checkpoint uses an older architecture; starting a new model")
@@ -265,18 +271,24 @@ def main():
     start = time.perf_counter()
     sync_cuda(device)
     last_log = start
+    window_tokens = 0
 
     for local_step in range(1, args.steps + 1):
         global_step = start_step + local_step
-        if cursor + args.batch_size > len(order):
+        if cursor >= len(order):
             epoch += 1
             cursor = 0
             order = list(range(len(data)))
             random.Random(args.seed + epoch).shuffle(order)
-        batch_indices = order[cursor:cursor + args.batch_size]
-        cursor += args.batch_size
 
-        x, y, batch_sections = make_batch(data, args.batch_size, args.seq_len, device, indices=batch_indices)
+        batch_indices = order[cursor:min(cursor + args.batch_size, len(order))]
+        cursor += len(batch_indices)
+        actual_batch_size = len(batch_indices)
+
+        x, y, batch_sections = make_batch(
+            data, actual_batch_size, args.seq_len, device, indices=batch_indices
+        )
+        window_tokens += x.numel()
         loss_weights = sections_to_weights(batch_sections, args.think_weight, args.answer_weight)
         optimizer.zero_grad(set_to_none=True)
         model.zero_grad(set_to_none=True)
@@ -304,7 +316,7 @@ def main():
             if found_inf:
                 model.zero_grad(set_to_none=True)
                 grad_scale = max(1.0, grad_scale / 2.0)
-                cursor -= args.batch_size
+                cursor -= actual_batch_size
                 if local_step == 1 or local_step % args.log_every == 0:
                     print(f"step={global_step:6d} skipped=nonfinite_grad grad_scale={grad_scale:g}")
                 continue
@@ -335,9 +347,9 @@ def main():
             sync_cuda(device)
             now = time.perf_counter()
             elapsed = max(now - last_log, 1e-9)
-            window_steps = args.log_every if local_step > args.log_every else local_step
-            tokens_s = (args.batch_size * args.seq_len * window_steps) / elapsed
+            tokens_s = window_tokens / elapsed
             print(f"step={global_step:6d} loss={loss.item():.6f} tok/s={tokens_s:,.0f} lr={current_lr:.6g} grad_scale={grad_scale:g}")
+            window_tokens = 0
             last_log = now
 
     sync_cuda(device)
@@ -352,6 +364,7 @@ def main():
         "config": {
             **model_cfg,
             "dictionary": str(args.dictionary),
+            "dictionary_fingerprint": dictionary_hash,
             "dataset": str(args.dataset),
             "loss_scheme_version": LOSS_SCHEME_VERSION,
             "architecture_version": ARCHITECTURE_VERSION,

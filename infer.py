@@ -1,7 +1,7 @@
 import argparse
 import torch
 
-from lln.data import load_dictionary, encode_prompt, decode_ids
+from lln.data import decode_ids, dictionary_fingerprint, encode_prompt, load_dictionary
 from lln.model import LLN
 
 
@@ -17,6 +17,7 @@ def checkpoint_dtype(checkpoint) -> torch.dtype:
 def main():
     parser = argparse.ArgumentParser(description="Generate text from an LLN checkpoint")
     parser.add_argument("--model", default="lln_model.pt")
+    parser.add_argument("--dictionary", default="data/dictionary.json")
     parser.add_argument("--prompt", default="eu gosto de")
     parser.add_argument("--new-tokens", type=int, default=128)
     parser.add_argument("--temperature", type=float, default=1.0)
@@ -39,11 +40,36 @@ def main():
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA requested but CUDA is not available")
 
-    word_to_id, id_to_word, token_types, dictionary_meta = load_dictionary(
-        "data/dictionary.json", with_metadata=True
-    )
     checkpoint = torch.load(args.model, map_location=device, weights_only=True)
     cfg = checkpoint["config"].copy()
+    word_to_id, id_to_word, token_types, dictionary_meta = load_dictionary(
+        args.dictionary, with_metadata=True
+    )
+    saved_architecture_version = cfg.get("architecture_version")
+    required_special_tokens = {
+        "<PAD>", "<BOS>", "<EOS>", "<UNK>",
+        "<USER>", "</USER>", "<THINK>", "</THINK>",
+        "<ANSWER>", "</ANSWER>",
+    }
+    missing_special_tokens = sorted(required_special_tokens.difference(word_to_id))
+    if missing_special_tokens:
+        raise ValueError(
+            "dictionary is stale or incompatible; missing special tokens: "
+            + ", ".join(missing_special_tokens)
+            + ". Rebuild it with create_ids.py or run train.py first."
+        )
+
+    if saved_architecture_version is not None and saved_architecture_version != LLN.ARCHITECTURE_VERSION:
+        raise ValueError(
+            f"checkpoint architecture version {saved_architecture_version} does not match "
+            f"runtime version {LLN.ARCHITECTURE_VERSION}"
+        )
+
+    saved_dictionary_hash = cfg.get("dictionary_fingerprint")
+    if saved_dictionary_hash and saved_dictionary_hash != dictionary_fingerprint(word_to_id):
+        raise ValueError(
+            "dictionary does not match checkpoint: token IDs may refer to different words"
+        )
 
     model_keys = {
         "vocab_size", "dim", "layers", "heads", "max_seq_len", "dropout",

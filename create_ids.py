@@ -1,7 +1,7 @@
 import argparse
 from pathlib import Path
 
-from lln.data import create_dictionary_from_dataset
+from lln.data import SPECIAL_TOKENS, create_dictionary_from_dataset
 
 
 def main():
@@ -16,7 +16,7 @@ def main():
     print(f"dataset={Path(args.dataset)}")
     print(f"dictionary={Path(args.output)}")
     print(f"vocab={len(word_to_id)}")
-    print(f"special_tokens=7 (<PAD>, <BOS>, <EOS>, <UNK>, <USER>, <THINK>, <ANSWER>)")
+    print(f"special_tokens={len(SPECIAL_TOKENS)}")
 
 
 if __name__ == "__main__":
