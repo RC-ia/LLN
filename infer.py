@@ -45,6 +45,13 @@ def main():
     word_to_id, id_to_word, token_types, dictionary_meta = load_dictionary(
         args.dictionary, with_metadata=True
     )
+    saved_architecture_version = cfg.get("architecture_version")
+    if saved_architecture_version is not None and saved_architecture_version != LLN.ARCHITECTURE_VERSION:
+        raise ValueError(
+            f"checkpoint architecture version {saved_architecture_version} does not match "
+            f"runtime version {LLN.ARCHITECTURE_VERSION}"
+        )
+
     saved_dictionary_hash = cfg.get("dictionary_fingerprint")
     if saved_dictionary_hash and saved_dictionary_hash != dictionary_fingerprint(word_to_id):
         raise ValueError(
