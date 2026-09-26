@@ -1,106 +1,115 @@
 # LLN — Linguistic Learning Network
 
-Experimento de IA que trabalha com **IDs numéricos** e usa um dicionário externo apenas para converter IDs em palavras.
-
-A rede não recebe strings durante o treinamento. O fluxo é:
+Experimento de rede neural autoregressiva que trabalha com **IDs numéricos**. O texto entra apenas na preparação do dataset e na decodificação da saída:
 
 ```text
-texto → criador de IDs → números → rede → números → dicionário → texto
+texto → IDs → LLN → IDs → texto
 ```
 
-## Objetivo
+## Arquitetura atual
 
-Testar quão rapidamente uma rede relativamente grande consegue aprender uma linguagem simples quando o alvo da rede é uma sequência de números.
+A LLN combina:
 
-O dicionário **não é fixo no código**. Ele é criado automaticamente a partir do dataset antes do treinamento e salvo como JSON para que a mesma numeração possa ser usada na inferência.
+- embeddings de token, tipo e posição;
+- atenção causal multi-head via `scaled_dot_product_attention`;
+- MLP por bloco;
+- banco de especialistas low-rank com roteamento top-2;
+- memória latente ativada durante `<THINK> ... </THINK>`;
+- múltiplas passagens recorrentes sobre os blocos;
+- cabeça de linguagem com pesos compartilhados com o embedding.
 
-## Estrutura
+A arquitetura atual é a versão **5**.
+
+## Dataset e dicionário
+
+O dataset JSON usa mensagens `user` e `assistant`, com `reasoning_content` opcional. O pipeline reserva os tokens especiais:
 
 ```text
-LLN/
-├── data/
-│   ├── dataset.txt
-│   └── dictionary.json
-├── lln/
-│   ├── __init__.py
-│   ├── model.py
-│   └── data.py
-├── create_ids.py
-├── infer.py
-├── train.py
-├── requirements.txt
-└── README.md
+<PAD> <BOS> <EOS> <UNK>
+<USER> </USER>
+<THINK> </THINK>
+<ANSWER> </ANSWER>
 ```
 
-## Criar IDs a partir de um dataset
+O dicionário é reconstruído a partir do dataset e recebe também metadados de tipo dos tokens.
 
-O dataset é um arquivo UTF-8 com uma frase por linha:
-
-```text
-casa grande
-casa pequena
-o gato corre
-```
-
-Execute:
+Crie/atualize o dicionário com:
 
 ```bash
-python create_ids.py data/dataset.txt --output data/dictionary.json
+python create_ids.py data/dataset.json --output data/dictionary.json
 ```
 
-O programa encontra as palavras automaticamente, reserva IDs para `<PAD>`, `<BOS>`, `<EOS>` e `<UNK>` e cria o restante dos IDs a partir do corpus.
-
-## Treinar
-
-O `train.py` também cria/atualiza automaticamente o dicionário antes do treino:
-
-```bash
-python train.py --dataset data/dataset.txt --steps 2000 --seq-len 32 --batch-size 32
-```
-
-A rede recebe somente os IDs inteiros. O texto é usado apenas na preparação do dataset.
-
-## Criar um modelo maior
-
-O tamanho é controlado por `--dim`, `--layers` e `--heads`.
+## Treinamento
 
 Exemplo:
 
 ```bash
-python train.py --dim 1024 --layers 12 --heads 16
+python train.py --dataset data/dataset.json --steps 2000 --seq-len 256 --batch-size 2
 ```
 
-Ou o modelo pequeno usado no primeiro experimento:
+O treinamento usa:
 
-```bash
-python train.py --dim 512 --layers 8 --heads 8 --steps 2000
-```
-
-## CPU ou GPU
-
-O código detecta CUDA automaticamente:
-
-```bash
-python train.py --device auto
-```
-
-Ou force:
-
-```bash
-python train.py --device cpu
-python train.py --device cuda
-```
+- parâmetros mestre em FP32 com AdamW;
+- warmup + decaimento cosine;
+- clipping de gradiente;
+- batches embaralhados sem reposição;
+- batches parciais no fim de cada época;
+- padding dinâmico por batch para evitar computação desnecessária;
+- pesos diferentes para raciocínio e resposta;
+- fingerprint do dicionário no checkpoint para impedir incompatibilidade silenciosa.
 
 ## Inferência
 
-Depois do treinamento:
-
 ```bash
-python infer.py --model lln_model.pt --prompt "eu gosto de"
+python infer.py --model lln_model.pt --prompt "eu gosto de" --new-tokens 128
 ```
 
-A entrada é convertida para IDs usando o dicionário salvo, a rede produz IDs e o programa converte os IDs de volta para palavras.
+A geração usa **KV cache** quando o prompt + geração cabem no contexto máximo. Nesse caminho, apenas o token novo passa pela rede a cada passo, evitando recalcular toda a sequência.
 
-## Experimento
+Para checkpoints ou dicionários em outros caminhos:
 
-A próxima etapa é aumentar o corpus e verificar se a rede consegue generalizar para sequências que não aparecem literalmente no treinamento. Isso separa memorização de aprendizado das relações entre os IDs.
+```bash
+python infer.py --model caminho/modelo.pt --dictionary caminho/dictionary.json
+```
+
+O carregador valida a versão da arquitetura e, em checkpoints recentes, o fingerprint do dicionário.
+
+## Diagnóstico
+
+O `debug_train.py` compara aprendizado no conjunto de treino e em exemplos mantidos fora do treino, além de verificar causalidade, gradientes, previsões teacher-forced e geração autoregressiva.
+
+```bash
+python debug_train.py --dataset data/dataset.json --dictionary data/dictionary.json
+```
+
+## Testes
+
+O projeto possui um smoke test que verifica:
+
+- equivalência básica entre geração com e sem cache;
+- shape e finitude da loss;
+- padding dinâmico;
+- fingerprint do dicionário;
+- fluxo de gradiente dos especialistas.
+
+Execute:
+
+```bash
+python tests/smoke_test.py
+```
+
+O mesmo teste é executado automaticamente pelo GitHub Actions em pushes para `main`/branches `auto/**` e em pull requests.
+
+## Experimentos de estrutura
+
+`build_structure.py` continua separado como experimento para agrupar tokens por contexto e construir uma família estrutural dedicada a números. Essa informação ainda não é forçada dentro do embedding principal da LLN; isso permite comparar a hipótese estrutural com uma baseline sem contaminar o modelo.
+
+## Próximos experimentos
+
+As próximas otimizações mais interessantes são comparar sistematicamente:
+
+1. IDs puramente lexicais vs. IDs com estrutura semântica explícita;
+2. `recurrent_steps=1/2/3`;
+3. diferentes pesos de `<THINK>` e `<ANSWER>`;
+4. memória latente ativada somente no raciocínio vs. memória recorrente geral;
+5. qualidade de generalização e custo de inferência após cada mudança.
