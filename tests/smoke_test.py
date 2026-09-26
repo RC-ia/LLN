@@ -23,7 +23,10 @@ def main():
     token_types = [0, 1, 1, 1, 1, 1] + [2] * (vocab_size - 6)
     model.set_token_types(token_types)
 
-    ids = torch.tensor([[1, 4, 8, 6, 10, 7]], dtype=torch.long)
+    ids = torch.tensor(
+        [[1, 4, 8, 6, 10, 7], [1, 5, 9, 6, 11, 7]],
+        dtype=torch.long,
+    )
 
     model.eval()
     with torch.no_grad():
@@ -54,7 +57,7 @@ def main():
         assert torch.equal(full, cached), f"cached generation diverged: {full} != {cached}"
 
         logits, loss = model(ids, ids)
-        assert logits.shape == (1, ids.size(1), vocab_size)
+        assert logits.shape == (ids.size(0), ids.size(1), vocab_size)
         assert torch.isfinite(loss)
 
     # Dynamic batching should avoid padding every batch to the global seq_len.
