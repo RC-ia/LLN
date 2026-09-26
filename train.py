@@ -314,7 +314,7 @@ def main():
             if found_inf:
                 model.zero_grad(set_to_none=True)
                 grad_scale = max(1.0, grad_scale / 2.0)
-                cursor -= args.batch_size
+                cursor -= actual_batch_size
                 if local_step == 1 or local_step % args.log_every == 0:
                     print(f"step={global_step:6d} skipped=nonfinite_grad grad_scale={grad_scale:g}")
                 continue
