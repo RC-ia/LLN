@@ -303,17 +303,14 @@ class TiedLMHead(nn.Module):
     def logits(self, x: torch.Tensor) -> torch.Tensor:
         return torch.matmul(x, self.embedding.weight.transpose(0, 1))
 
-    def loss(self, x: torch.Tensor, targets: torch.Tensor, weights: torch.Tensor | None = None) -> torch.Tensor:
-        logits = self.logits(x)
+    def loss(self, logits: torch.Tensor, targets: torch.Tensor, weights: torch.Tensor | None = None) -> torch.Tensor:
         flat_logits = logits.reshape(-1, self.vocab_size)
         flat_targets = targets.reshape(-1)
         token_loss = nn.functional.cross_entropy(flat_logits.float(), flat_targets, reduction="none")
         if weights is None:
             return token_loss.mean()
         flat_weights = weights.reshape(-1).to(token_loss.dtype)
-        weight_sum = flat_weights.sum()
-        if weight_sum.item() <= 0.0:
-            raise ValueError("loss_weights must contain at least one positive weight")
+        weight_sum = flat_weights.sum().clamp_min(1e-12)
         return (token_loss * flat_weights).sum() / weight_sum
 
 
@@ -389,7 +386,7 @@ class LLN(nn.Module):
             x = self.latent_memory(x, input_ids, self.THINK_TOKEN_ID, self.THINK_END_TOKEN_ID)
         x = self.norm(x)
         logits = self.lm_head.logits(x)
-        loss = None if targets is None else self.lm_head.loss(x, targets, weights=loss_weights)
+        loss = None if targets is None else self.lm_head.loss(logits, targets, weights=loss_weights)
         return logits, loss
 
     def _adjust_generation_logits(
