@@ -21,19 +21,63 @@ class CausalSelfAttention(nn.Module):
         self.out = nn.Linear(dim, dim, bias=False)
         self.dropout = dropout
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def _project(self, x: torch.Tensor):
         b, t, c = x.shape
         q, k, v = self.qkv(x).chunk(3, dim=-1)
         q = q.view(b, t, self.heads, self.head_dim).transpose(1, 2)
         k = k.view(b, t, self.heads, self.head_dim).transpose(1, 2)
         v = v.view(b, t, self.heads, self.head_dim).transpose(1, 2)
+        return q, k, v
+
+    def _merge(self, y: torch.Tensor) -> torch.Tensor:
+        b, _, t, _ = y.shape
+        c = self.heads * self.head_dim
+        return self.out(y.transpose(1, 2).contiguous().view(b, t, c))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        q, k, v = self._project(x)
         y = torch.nn.functional.scaled_dot_product_attention(
             q, k, v, attn_mask=None,
             dropout_p=self.dropout if self.training else 0.0,
             is_causal=True,
         )
-        return self.out(y.transpose(1, 2).contiguous().view(b, t, c))
+        return self._merge(y)
 
+    def forward_with_kv(self, x: torch.Tensor):
+        q, k, v = self._project(x)
+        y = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, attn_mask=None,
+            dropout_p=self.dropout if self.training else 0.0,
+            is_causal=True,
+        )
+        return self._merge(y), k, v
+
+    def allocate_cache(self, batch_size: int, max_seq_len: int, device, dtype):
+        shape = (batch_size, self.heads, max_seq_len, self.head_dim)
+        return (
+            torch.empty(shape, device=device, dtype=dtype),
+            torch.empty(shape, device=device, dtype=dtype),
+        )
+
+    def forward_step(
+        self,
+        x: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        cache_pos: int,
+    ) -> torch.Tensor:
+        q, k, v = self._project(x)
+        cache_k[:, :, cache_pos:cache_pos + 1, :].copy_(k)
+        cache_v[:, :, cache_pos:cache_pos + 1, :].copy_(v)
+        k_all = cache_k[:, :, :cache_pos + 1, :]
+        v_all = cache_v[:, :, :cache_pos + 1, :]
+        y = torch.nn.functional.scaled_dot_product_attention(
+            q, k_all, v_all,
+            attn_mask=None,
+            dropout_p=0.0,
+            is_causal=False,
+        )
+        return self._merge(y)
 
 class MLP(nn.Module):
     def __init__(self, dim: int, multiplier: float = 4.0, dropout: float = 0.0):
@@ -54,7 +98,7 @@ class LowRankSpecialist(nn.Module):
         self.down = nn.Linear(dim, rank, bias=False)
         self.up = nn.Linear(rank, dim, bias=False)
         self.act = nn.GELU()
-        self.scale = nn.Parameter(torch.tensor(0.0))
+        self.scale = nn.Parameter(torch.tensor(0.01))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.up(self.act(self.down(x))) * self.scale
@@ -74,16 +118,30 @@ class SpecialistBank(nn.Module):
         k = min(2, self.specialists)
         topv, topi = torch.topk(gate_logits, k=k, dim=-1)
         topw = torch.softmax(topv.float(), dim=-1).to(x.dtype)
-        result = torch.zeros_like(x)
-        for expert_idx, expert in enumerate(self.experts):
-            active = topi.eq(expert_idx)
-            if not active.any():
-                continue
-            value = expert(x)
-            weight = torch.where(active, topw, torch.zeros_like(topw)).sum(dim=-1, keepdim=True)
-            result = result + value * weight
-        return result
 
+        flat_x = x.reshape(-1, x.size(-1))
+        flat_topi = topi.reshape(-1, k)
+        flat_topw = topw.reshape(-1, k)
+        flat_result = torch.zeros_like(flat_x)
+        token_idx = torch.arange(flat_x.size(0), device=x.device)
+
+        for expert_idx, expert in enumerate(self.experts):
+            active = flat_topi.eq(expert_idx)
+            selected = active.any(dim=-1)
+            if not selected.any():
+                continue
+            selected_idx = token_idx[selected]
+            values = expert(flat_x[selected])
+            weights = torch.where(
+                active[selected],
+                flat_topw[selected],
+                torch.zeros_like(flat_topw[selected]),
+            ).sum(dim=-1, keepdim=True)
+            flat_result = flat_result.index_add(
+                0, selected_idx, values * weights
+            )
+
+        return flat_result.reshape_as(x)
 
 class Block(nn.Module):
     def __init__(self, dim: int, heads: int, type_count: int, dropout: float = 0.0):
@@ -94,12 +152,32 @@ class Block(nn.Module):
         self.mlp = MLP(dim, 4.0, dropout)
         self.specialists = SpecialistBank(dim, type_count)
 
-    def forward(self, x: torch.Tensor, token_types: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.norm1(x))
+    def forward(self, x: torch.Tensor, token_types: torch.Tensor, return_kv: bool = False):
+        hidden = self.norm1(x)
+        if return_kv:
+            attn_out, k, v = self.attn.forward_with_kv(hidden)
+        else:
+            attn_out = self.attn(hidden)
+            k = v = None
+        x = x + attn_out
         hidden = self.norm2(x)
         x = x + self.mlp(hidden) + self.specialists(hidden, token_types)
+        if return_kv:
+            return x, k, v
         return x
 
+    def forward_step(
+        self,
+        x: torch.Tensor,
+        token_types: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        cache_pos: int,
+    ) -> torch.Tensor:
+        hidden = self.norm1(x)
+        x = x + self.attn.forward_step(hidden, cache_k, cache_v, cache_pos)
+        hidden = self.norm2(x)
+        return x + self.mlp(hidden) + self.specialists(hidden, token_types)
 
 class LatentReasoningMemory(nn.Module):
     def __init__(self, dim: int, slots: int = 4):
@@ -123,19 +201,25 @@ class LatentReasoningMemory(nn.Module):
         return depth.gt(0)
 
     def forward(self, x: torch.Tensor, input_ids: torch.Tensor, think_id: int, think_end_id: int) -> torch.Tensor:
+        return self.forward_with_state(x, input_ids, think_id, think_end_id)[0]
+
+    def forward_with_state(self, x: torch.Tensor, input_ids: torch.Tensor, think_id: int, think_end_id: int):
         active = self._active_think(input_ids, think_id, think_end_id)
         mask = active.to(x.dtype).unsqueeze(-1)
-        counts = mask.cumsum(dim=1).clamp_min(1.0)
-        cumulative = (x * mask).cumsum(dim=1) / counts
+        counts = mask.cumsum(dim=1)
+        cumulative = (x * mask).cumsum(dim=1) / counts.clamp_min(1.0)
+
         state_latent = torch.tanh(self.state_in(cumulative))
         state = self.state_out(state_latent)
         state = state * torch.sigmoid(self.state_gate(cumulative))
+
         write_logits = self.write_gate(cumulative)
-        writes = torch.softmax(write_logits.float(), dim=-1).to(x.dtype)
+        writes = torch.softmax(write_logits.float(), dim=-1).to(x.dtype) * mask
         values = torch.tanh(self.write_value(cumulative))
-        memory = (writes.unsqueeze(-1) * values.unsqueeze(2)).cumsum(dim=1)
-        write_norm = writes.cumsum(dim=1).unsqueeze(-1).clamp_min(1e-4)
-        memory = memory / write_norm
+        write_accum = (writes.unsqueeze(-1) * values.unsqueeze(2)).cumsum(dim=1)
+        write_norm = writes.cumsum(dim=1)
+        memory = write_accum / write_norm.unsqueeze(-1).clamp_min(1e-4)
+
         query = self.query(cumulative)
         read_weights = torch.softmax(
             torch.einsum("btd,sd->bts", query.float(), self.slot_keys.float()), dim=-1
@@ -143,8 +227,69 @@ class LatentReasoningMemory(nn.Module):
         read = torch.einsum("bts,btsd->btd", read_weights, memory)
         latent = state + read
         gated = latent * torch.sigmoid(self.memory_gate(cumulative))
-        return x + mask * gated
+        output = x + mask * gated
 
+        state_out = {
+            "active": active[:, -1],
+            "count": counts[:, -1:].detach(),
+            "cumulative": cumulative[:, -1].detach(),
+            "write_accum": write_accum[:, -1].detach(),
+            "write_norm": write_norm[:, -1].detach(),
+        }
+        return output, state_out
+
+    def step(
+        self,
+        x: torch.Tensor,
+        input_ids: torch.Tensor,
+        state: dict,
+        think_id: int,
+        think_end_id: int,
+    ):
+        opened = input_ids.eq(think_id).squeeze(-1)
+        closed = input_ids.eq(think_end_id).squeeze(-1)
+        token_active = (state["active"] | opened) & ~closed
+
+        previous_count = state["count"]
+        new_count = previous_count + token_active.to(x.dtype).unsqueeze(-1)
+        cumulative = state["cumulative"]
+        updated_cumulative = (
+            previous_count * cumulative + x.squeeze(1)
+        ) / new_count.clamp_min(1.0)
+        cumulative = torch.where(
+            token_active.unsqueeze(-1),
+            updated_cumulative,
+            cumulative,
+        )
+
+        state_latent = torch.tanh(self.state_in(cumulative))
+        latent_state = self.state_out(state_latent)
+        latent_state = latent_state * torch.sigmoid(self.state_gate(cumulative))
+
+        write_logits = self.write_gate(cumulative)
+        writes = torch.softmax(write_logits.float(), dim=-1).to(x.dtype)
+        writes = writes * token_active.to(x.dtype).unsqueeze(-1)
+        values = torch.tanh(self.write_value(cumulative))
+        write_accum = state["write_accum"] + writes.unsqueeze(-1) * values.unsqueeze(1)
+        write_norm = state["write_norm"] + writes
+        memory = write_accum / write_norm.unsqueeze(-1).clamp_min(1e-4)
+
+        query = self.query(cumulative)
+        read_weights = torch.softmax(
+            torch.einsum("bd,sd->bs", query.squeeze(1).float(), self.slot_keys.float()), dim=-1
+        ).to(x.dtype)
+        read = torch.einsum("bs,bsd->bd", read_weights, memory).unsqueeze(1)
+
+        gated = (latent_state.unsqueeze(1) + read) * torch.sigmoid(self.memory_gate(cumulative)).unsqueeze(1)
+        output = x + token_active.to(x.dtype).view(-1, 1, 1) * gated
+
+        return output, {
+            "active": token_active,
+            "count": new_count,
+            "cumulative": cumulative,
+            "write_accum": write_accum,
+            "write_norm": write_norm,
+        }
 
 class TiedLMHead(nn.Module):
     def __init__(self, embedding: nn.Embedding):
@@ -173,7 +318,7 @@ class TiedLMHead(nn.Module):
 
 
 class LLN(nn.Module):
-    ARCHITECTURE_VERSION = 4
+    ARCHITECTURE_VERSION = 5
     THINK_TOKEN_ID = 6
     THINK_END_TOKEN_ID = 7
 
@@ -205,7 +350,7 @@ class LLN(nn.Module):
 
     @property
     def cluster_size(self) -> int:
-        return self.lm_head.vocab_size
+        return self.token_cluster.num_embeddings
 
     def set_token_types(self, token_types: list[int] | torch.Tensor) -> None:
         values = torch.as_tensor(token_types, dtype=torch.long, device=self.token_type_map.device)
@@ -247,12 +392,223 @@ class LLN(nn.Module):
         loss = None if targets is None else self.lm_head.loss(x, targets, weights=loss_weights)
         return logits, loss
 
+    def _adjust_generation_logits(
+        self,
+        next_logits: torch.Tensor,
+        history: torch.Tensor,
+        repetition_penalty: float,
+        no_repeat_ngram_size: int,
+        repetition_window: int,
+        frequency_penalty: float,
+        presence_penalty: float,
+        hard_repeat_threshold: int,
+    ) -> torch.Tensor:
+        adjusted = next_logits.float().clone()
+        raw = adjusted.clone()
+
+        for batch_idx in range(history.size(0)):
+            recent = history[batch_idx, -repetition_window:] if repetition_window > 0 else history[batch_idx]
+            recent_list = [int(token) for token in recent.tolist()]
+            counts = {}
+            for token_id in recent_list:
+                counts[token_id] = counts.get(token_id, 0) + 1
+
+            if repetition_penalty > 1.0:
+                for token_id in counts:
+                    value = adjusted[batch_idx, token_id]
+                    adjusted[batch_idx, token_id] = (
+                        value * repetition_penalty if value < 0 else value / repetition_penalty
+                    )
+
+            if presence_penalty > 0.0:
+                for token_id in counts:
+                    adjusted[batch_idx, token_id] -= presence_penalty
+
+            if frequency_penalty > 0.0:
+                for token_id, count in counts.items():
+                    adjusted[batch_idx, token_id] -= frequency_penalty * count
+
+            if hard_repeat_threshold > 0:
+                blocked = [token_id for token_id, count in counts.items() if count >= hard_repeat_threshold]
+                if blocked:
+                    adjusted[batch_idx, blocked] = float("-inf")
+
+            if no_repeat_ngram_size >= 2 and history.size(1) >= no_repeat_ngram_size - 1:
+                tokens = history[batch_idx].tolist()
+                prefix = tuple(tokens[-(no_repeat_ngram_size - 1):])
+                banned = set()
+                for i in range(len(tokens) - no_repeat_ngram_size + 1):
+                    ngram = tuple(tokens[i:i + no_repeat_ngram_size])
+                    if ngram[:-1] == prefix:
+                        banned.add(ngram[-1])
+                if banned:
+                    adjusted[batch_idx, list(banned)] = float("-inf")
+
+            if not torch.isfinite(adjusted[batch_idx]).any():
+                adjusted[batch_idx] = raw[batch_idx]
+
+        return adjusted
+
     @torch.no_grad()
-    def generate(self, input_ids: torch.Tensor, max_new_tokens: int = 128, temperature: float = 1.0,
-                 repetition_penalty: float = 1.15, no_repeat_ngram_size: int = 3,
-                 repetition_window: int = 64, frequency_penalty: float = 0.08,
-                 presence_penalty: float = 0.20, hard_repeat_threshold: int = 6,
-                 stop_ids=None):
+    def _generate_full(
+        self,
+        input_ids: torch.Tensor,
+        max_new_tokens: int,
+        temperature: float,
+        repetition_penalty: float,
+        no_repeat_ngram_size: int,
+        repetition_window: int,
+        frequency_penalty: float,
+        presence_penalty: float,
+        hard_repeat_threshold: int,
+        stop_ids,
+    ):
+        for _ in range(max_new_tokens):
+            x = input_ids[:, -self.max_seq_len:]
+            logits, _ = self(x)
+            next_logits = self._adjust_generation_logits(
+                logits[:, -1, :],
+                input_ids,
+                repetition_penalty,
+                no_repeat_ngram_size,
+                repetition_window,
+                frequency_penalty,
+                presence_penalty,
+                hard_repeat_threshold,
+            )
+            if temperature == 1.0:
+                next_id = torch.argmax(next_logits, dim=-1, keepdim=True)
+            else:
+                probabilities = torch.softmax(next_logits / temperature, dim=-1)
+                next_id = torch.multinomial(probabilities, num_samples=1)
+            input_ids = torch.cat([input_ids, next_id], dim=1)
+            if all(int(next_id[i, 0]) in stop_ids for i in range(next_id.size(0))):
+                break
+        return input_ids
+
+    @torch.no_grad()
+    def _prefill_cache(self, input_ids: torch.Tensor):
+        batch_size, seq_len = input_ids.shape
+        x, token_types = self._embed(input_ids)
+        caches = []
+        memory_states = []
+
+        for _ in range(self.recurrent_steps):
+            layer_caches = []
+            for block in self.blocks:
+                x, k, v = block(x, token_types, return_kv=True)
+                cache_k, cache_v = block.attn.allocate_cache(
+                    batch_size, self.max_seq_len, input_ids.device, x.dtype
+                )
+                cache_k[:, :, :seq_len, :].copy_(k)
+                cache_v[:, :, :seq_len, :].copy_(v)
+                layer_caches.append((cache_k, cache_v))
+            x, state = self.latent_memory.forward_with_state(
+                x, input_ids, self.THINK_TOKEN_ID, self.THINK_END_TOKEN_ID
+            )
+            caches.append(layer_caches)
+            memory_states.append(state)
+
+        x = self.norm(x)
+        return self.lm_head.logits(x), caches, memory_states
+
+    def _embed_step(self, input_ids: torch.Tensor, position: int):
+        token_types = self.token_type_map[input_ids]
+        clusters = torch.div(
+            input_ids, max(1, self.output_clusters), rounding_mode="floor"
+        ).clamp(max=self.token_cluster.num_embeddings - 1)
+        pos = torch.tensor([position], device=input_ids.device, dtype=torch.long)
+        x = (
+            self.token(input_ids)
+            + self.token_type(token_types)
+            + self.token_cluster(clusters)
+            + self.position(pos)[None, :, :]
+        )
+        return x, token_types
+
+    @torch.no_grad()
+    def _generate_cached(
+        self,
+        input_ids: torch.Tensor,
+        max_new_tokens: int,
+        temperature: float,
+        repetition_penalty: float,
+        no_repeat_ngram_size: int,
+        repetition_window: int,
+        frequency_penalty: float,
+        presence_penalty: float,
+        hard_repeat_threshold: int,
+        stop_ids,
+    ):
+        batch_size, prompt_len = input_ids.shape
+        output = torch.empty(
+            batch_size,
+            prompt_len + max_new_tokens,
+            dtype=input_ids.dtype,
+            device=input_ids.device,
+        )
+        output[:, :prompt_len] = input_ids
+
+        logits, caches, memory_states = self._prefill_cache(input_ids)
+        current_len = prompt_len
+
+        for _ in range(max_new_tokens):
+            history = output[:, :current_len]
+            next_logits = self._adjust_generation_logits(
+                logits[:, -1, :],
+                history,
+                repetition_penalty,
+                no_repeat_ngram_size,
+                repetition_window,
+                frequency_penalty,
+                presence_penalty,
+                hard_repeat_threshold,
+            )
+            if temperature == 1.0:
+                next_id = torch.argmax(next_logits, dim=-1, keepdim=True)
+            else:
+                probabilities = torch.softmax(next_logits / temperature, dim=-1)
+                next_id = torch.multinomial(probabilities, num_samples=1)
+
+            output[:, current_len:current_len + 1] = next_id
+            current_len += 1
+            if all(int(next_id[i, 0]) in stop_ids for i in range(next_id.size(0))):
+                break
+
+            x, token_types = self._embed_step(next_id, current_len - 1)
+            cache_pos = current_len - 1
+            for recurrent_idx in range(self.recurrent_steps):
+                for block_idx, block in enumerate(self.blocks):
+                    cache_k, cache_v = caches[recurrent_idx][block_idx]
+                    x = block.forward_step(
+                        x, token_types, cache_k, cache_v, cache_pos
+                    )
+                x, memory_states[recurrent_idx] = self.latent_memory.step(
+                    x,
+                    next_id,
+                    memory_states[recurrent_idx],
+                    self.THINK_TOKEN_ID,
+                    self.THINK_END_TOKEN_ID,
+                )
+
+            logits = self.lm_head.logits(self.norm(x))
+
+        return output[:, :current_len]
+
+    @torch.no_grad()
+    def generate(
+        self,
+        input_ids: torch.Tensor,
+        max_new_tokens: int = 128,
+        temperature: float = 1.0,
+        repetition_penalty: float = 1.15,
+        no_repeat_ngram_size: int = 3,
+        repetition_window: int = 64,
+        frequency_penalty: float = 0.08,
+        presence_penalty: float = 0.20,
+        hard_repeat_threshold: int = 6,
+        stop_ids=None,
+    ):
         self.eval()
         if temperature <= 0.0:
             raise ValueError("temperature must be > 0")
@@ -266,61 +622,22 @@ class LLN(nn.Module):
             raise ValueError("frequency_penalty and presence_penalty must be >= 0")
         if hard_repeat_threshold < 2:
             raise ValueError("hard_repeat_threshold must be >= 2")
+        if input_ids.ndim != 2:
+            raise ValueError("input_ids must have shape [batch, sequence]")
+        if max_new_tokens <= 0:
+            return input_ids
         stop_ids = set(stop_ids or {2})
-
-        for _ in range(max_new_tokens):
-            x = input_ids[:, -self.max_seq_len:]
-            logits, _ = self(x)
-            next_logits = logits[:, -1, :].float().clone()
-
-            for batch_idx in range(input_ids.size(0)):
-                recent = input_ids[batch_idx, -repetition_window:] if repetition_window > 0 else input_ids[batch_idx]
-                recent_list = [int(token) for token in recent.tolist()]
-                counts = {}
-                for token_id in recent_list:
-                    counts[token_id] = counts.get(token_id, 0) + 1
-
-                if repetition_penalty > 1.0:
-                    for token_id in counts:
-                        value = next_logits[batch_idx, token_id]
-                        next_logits[batch_idx, token_id] = (
-                            value * repetition_penalty if value < 0 else value / repetition_penalty
-                        )
-
-                if presence_penalty > 0.0:
-                    for token_id in counts:
-                        next_logits[batch_idx, token_id] -= presence_penalty
-
-                if frequency_penalty > 0.0:
-                    for token_id, count in counts.items():
-                        next_logits[batch_idx, token_id] -= frequency_penalty * count
-
-                # Hard block tokens that have become pathological repetitions.
-                if hard_repeat_threshold > 0:
-                    blocked = [token_id for token_id, count in counts.items() if count >= hard_repeat_threshold]
-                    if blocked:
-                        next_logits[batch_idx, blocked] = float("-inf")
-
-                if no_repeat_ngram_size >= 2 and input_ids.size(1) >= no_repeat_ngram_size - 1:
-                    tokens = input_ids[batch_idx].tolist()
-                    prefix = tuple(tokens[-(no_repeat_ngram_size - 1):])
-                    banned = set()
-                    for i in range(len(tokens) - no_repeat_ngram_size + 1):
-                        ngram = tuple(tokens[i:i + no_repeat_ngram_size])
-                        if ngram[:-1] == prefix:
-                            banned.add(ngram[-1])
-                    if banned:
-                        next_logits[batch_idx, list(banned)] = float("-inf")
-
-            if temperature == 1.0:
-                next_id = torch.argmax(next_logits, dim=-1, keepdim=True)
-            else:
-                probabilities = torch.softmax(next_logits / temperature, dim=-1)
-                next_id = torch.multinomial(probabilities, num_samples=1)
-            input_ids = torch.cat([input_ids, next_id], dim=1)
-            if all(int(next_id[i, 0]) in stop_ids for i in range(next_id.size(0))):
-                break
-        return input_ids
+        if input_ids.size(1) + max_new_tokens <= self.max_seq_len:
+            return self._generate_cached(
+                input_ids, max_new_tokens, temperature, repetition_penalty,
+                no_repeat_ngram_size, repetition_window, frequency_penalty,
+                presence_penalty, hard_repeat_threshold, stop_ids
+            )
+        return self._generate_full(
+            input_ids, max_new_tokens, temperature, repetition_penalty,
+            no_repeat_ngram_size, repetition_window, frequency_penalty,
+            presence_penalty, hard_repeat_threshold, stop_ids
+        )
 
 
 def parameter_count(model: nn.Module) -> int:
