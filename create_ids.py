@@ -16,7 +16,7 @@ def main():
     print(f"dataset={Path(args.dataset)}")
     print(f"dictionary={Path(args.output)}")
     print(f"vocab={len(word_to_id)}")
-    print(f"special_tokens=7 (<PAD>, <BOS>, <EOS>, <UNK>, <USER>, <THINK>, <ANSWER>)")
+    print(f"special_tokens={len(__import__('lln.data', fromlist=['SPECIAL_TOKENS']).SPECIAL_TOKENS)}")
 
 
 if __name__ == "__main__":
