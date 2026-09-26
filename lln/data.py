@@ -1,3 +1,4 @@
+import hashlib
 import json
 import random
 import re
@@ -64,6 +65,15 @@ def build_dictionary_metadata(word_to_id: dict[str, int]) -> dict:
         "type_names": {str(k): v for k, v in TYPE_NAMES.items()},
         "token_types": token_types,
     }
+
+
+def dictionary_fingerprint(word_to_id: dict[str, int]) -> str:
+    payload = json.dumps(
+        sorted((str(token), int(idx)) for token, idx in word_to_id.items()),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def metadata_path(dictionary_path: str | Path) -> Path:
@@ -263,29 +273,41 @@ def build_dataset(
 def make_batch(data, batch_size: int, seq_len: int, device, sections=None, indices=None):
     if not data:
         raise ValueError("Dataset contains no training examples")
+    if seq_len < 1:
+        raise ValueError("seq_len must be >= 1")
     if sections is not None:
         raise ValueError("sections argument is no longer used; build_dataset returns complete records")
 
     if indices is None:
+        if batch_size < 1:
+            raise ValueError("batch_size must be >= 1")
         chosen = [random.choice(data) for _ in range(batch_size)]
     else:
-        if len(indices) != batch_size:
-            raise ValueError("indices length must equal batch_size")
         chosen = [data[i] for i in indices]
+        if not chosen:
+            raise ValueError("indices must contain at least one example")
 
+    max_tokens = 0
+    for ids, sec in chosen:
+        if len(ids) > seq_len + 1:
+            raise ValueError(
+                "Training record exceeds seq_len; build_dataset must be called with max_len=seq_len"
+            )
+        if len(ids) < 2:
+            raise ValueError("Training record must contain at least two tokens")
+        max_tokens = max(max_tokens, len(ids) - 1)
+
+    target_len = min(seq_len, max_tokens)
     x_rows, y_rows, w_rows = [], [], []
     pad_id = 0
 
     for ids, sec in chosen:
-        if len(ids) > seq_len + 1:
-            raise ValueError("Training record exceeds seq_len; build_dataset must be called with max_len=seq_len")
-        if len(ids) < 2:
-            continue
-
         x_ids = ids[:-1]
         y_ids = ids[1:]
         y_sec = sec[1:]
-        pad_count = seq_len - len(x_ids)
+        pad_count = target_len - len(x_ids)
+        if pad_count < 0:
+            raise ValueError("record is longer than the dynamic batch length")
         if pad_count > 0:
             x_ids += [pad_id] * pad_count
             y_ids += [pad_id] * pad_count
@@ -295,14 +317,10 @@ def make_batch(data, batch_size: int, seq_len: int, device, sections=None, indic
         y_rows.append(y_ids)
         w_rows.append(y_sec)
 
-    if not x_rows:
-        raise ValueError("No valid training examples")
-
     x = torch.tensor(x_rows, dtype=torch.long, device=device)
     y = torch.tensor(y_rows, dtype=torch.long, device=device)
     batch_sections = torch.tensor(w_rows, dtype=torch.float32, device=device)
     return x, y, batch_sections
-
 
 def decode_ids(ids: list[int], id_to_word: dict[int, str]) -> str:
     words = []
