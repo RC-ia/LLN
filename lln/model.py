@@ -446,7 +446,7 @@ class LLN(nn.Module):
 
         return adjusted
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def _generate_full(
         self,
         input_ids: torch.Tensor,
@@ -483,7 +483,7 @@ class LLN(nn.Module):
                 break
         return input_ids
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def _prefill_cache(self, input_ids: torch.Tensor):
         batch_size, seq_len = input_ids.shape
         x, token_types = self._embed(input_ids)
@@ -523,7 +523,7 @@ class LLN(nn.Module):
         )
         return x, token_types
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def _generate_cached(
         self,
         input_ids: torch.Tensor,
@@ -592,7 +592,7 @@ class LLN(nn.Module):
 
         return output[:, :current_len]
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def generate(
         self,
         input_ids: torch.Tensor,
