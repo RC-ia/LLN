@@ -46,6 +46,19 @@ def main():
         args.dictionary, with_metadata=True
     )
     saved_architecture_version = cfg.get("architecture_version")
+    required_special_tokens = {
+        "<PAD>", "<BOS>", "<EOS>", "<UNK>",
+        "<USER>", "</USER>", "<THINK>", "</THINK>",
+        "<ANSWER>", "</ANSWER>",
+    }
+    missing_special_tokens = sorted(required_special_tokens.difference(word_to_id))
+    if missing_special_tokens:
+        raise ValueError(
+            "dictionary is stale or incompatible; missing special tokens: "
+            + ", ".join(missing_special_tokens)
+            + ". Rebuild it with create_ids.py or run train.py first."
+        )
+
     if saved_architecture_version is not None and saved_architecture_version != LLN.ARCHITECTURE_VERSION:
         raise ValueError(
             f"checkpoint architecture version {saved_architecture_version} does not match "
