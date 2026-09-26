@@ -18,6 +18,8 @@ def pick_dtype(name: str, device: torch.device):
     if name == "float32":
         return torch.float32
     if name == "float16":
+        if device.type == "cpu":
+            raise RuntimeError("float16 training requires CUDA; use --dtype float32 on CPU")
         return torch.float16
     if name == "bfloat16":
         if device.type == "cpu" and not torch.cuda.is_bf16_supported():
