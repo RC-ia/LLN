@@ -42,7 +42,7 @@ def main():
 
     checkpoint = torch.load(args.model, map_location=device, weights_only=True)
     cfg = checkpoint["config"].copy()
-    word_to_id, id_to_word, token_types, dictionary_meta = load_dictionary(
+    word_to_id, id_to_word, _, dictionary_meta = load_dictionary(
         args.dictionary, with_metadata=True
     )
     saved_architecture_version = cfg.get("architecture_version")
@@ -72,14 +72,13 @@ def main():
         )
 
     model_keys = {
-        "vocab_size", "dim", "layers", "heads", "max_seq_len", "dropout",
-        "recurrent_steps", "output_clusters", "memory_slots", "type_count",
+        "vocab_size", "dim", "layers", "heads", "kv_heads", "max_seq_len",
+        "dropout", "rope_theta",
     }
     cfg = {key: value for key, value in cfg.items() if key in model_keys}
 
     model_dtype = checkpoint_dtype(checkpoint)
     model = LLN(**cfg).to(device=device, dtype=model_dtype)
-    model.set_token_types(token_types)
     model.load_state_dict(checkpoint["model"])
     model.eval()
 
@@ -99,10 +98,10 @@ def main():
 
     print("architecture_version:", LLN.ARCHITECTURE_VERSION)
     print("dtype:", model_dtype)
-    print("recurrent_steps:", model.recurrent_steps)
-    print("output_clusters:", model.output_clusters)
-    print("memory_slots:", model.memory_slots)
-    print("dictionary_types:", dictionary_meta.get("type_names", {}))
+    print("attention_heads:", model.heads)
+    print("kv_heads:", model.kv_heads)
+    print("rope_theta:", model.rope_theta)
+    print("dictionary_metadata_version:", dictionary_meta.get("version", 1))
     print("temperature:", args.temperature)
     print("repetition_penalty:", args.repetition_penalty)
     print("no_repeat_ngram:", args.no_repeat_ngram)
