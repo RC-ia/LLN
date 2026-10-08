@@ -1,28 +1,45 @@
 # LLN — Linguistic Learning Network
 
-Experimento de rede neural autoregressiva que trabalha com **IDs numéricos**. O texto entra apenas na preparação do dataset e na decodificação da saída:
+LLN é um experimento de modelo de linguagem autoregressivo em PyTorch. A versão 6 adota uma arquitetura **Transformer decoder-only densa**, inspirada em componentes usados nas famílias Llama e SmolLM.
+
+## Arquitetura v6
+
+Fluxo principal:
 
 ```text
-texto → IDs → LLN → IDs → texto
+IDs → token embeddings → Transformer blocks → RMSNorm → LM head → próximo token
 ```
 
-## Arquitetura atual
+Cada bloco usa:
 
-A LLN combina:
+- **RoPE (Rotary Position Embeddings)** para codificar posições dentro da atenção;
+- **Grouped-Query Attention (GQA)**, com menos cabeças de K/V do que cabeças de consulta;
+- **RMSNorm** antes da atenção e do MLP;
+- **SwiGLU** como feed-forward;
+- conexões residuais e projeções lineares sem bias;
+- KV cache compacto para a geração autoregressiva.
 
-- embeddings de token, tipo e posição;
-- atenção causal multi-head via `scaled_dot_product_attention`;
-- MLP por bloco;
-- banco de especialistas low-rank com roteamento top-2;
-- memória latente ativada durante `<THINK> ... </THINK>`;
-- múltiplas passagens recorrentes sobre os blocos;
-- cabeça de linguagem com pesos compartilhados com o embedding.
+A cabeça de linguagem compartilha os pesos com a matriz de embeddings dos tokens (*weight tying*).
 
-A arquitetura atual é a versão **5**.
+Os mecanismos experimentais da v5 — recorrência dos blocos, banco de especialistas low-rank, memória latente de raciocínio e embedding de clusters — não fazem parte da baseline v6. Eles poderão voltar em experimentos isolados, desde que o ganho seja medido contra essa baseline.
+
+### Configuração padrão
+
+| Parâmetro | Padrão |
+|---|---:|
+| Dimensão oculta | 512 |
+| Blocos Transformer | 8 |
+| Cabeças de consulta | 8 |
+| Cabeças K/V | 4 |
+| Contexto de treinamento | 256 tokens |
+| RoPE theta | 10.000 |
+| Dropout | 0,0 |
+
+Os valores são configuráveis pela linha de comando. A implementação exige que a dimensão seja divisível pelo número de cabeças, que a dimensão por cabeça seja par e que o número de cabeças de consulta seja divisível pelo número de cabeças K/V.
 
 ## Dataset e dicionário
 
-O dataset JSON usa mensagens `user` e `assistant`, com `reasoning_content` opcional. O pipeline reserva os tokens especiais:
+O dataset JSON aceita mensagens `user` e `assistant`, com `reasoning_content` opcional. O pipeline usa os marcadores:
 
 ```text
 <PAD> <BOS> <EOS> <UNK>
@@ -31,9 +48,11 @@ O dataset JSON usa mensagens `user` e `assistant`, com `reasoning_content` opcio
 <ANSWER> </ANSWER>
 ```
 
-O dicionário é reconstruído a partir do dataset e recebe também metadados de tipo dos tokens.
+O pipeline atual normaliza o texto para minúsculas e faz a tokenização por espaços. O dicionário é reconstruído a partir do dataset durante o treinamento, e o checkpoint guarda uma impressão digital do mapeamento de IDs para detectar incompatibilidades.
 
-Crie/atualize o dicionário com:
+**Limitação conhecida:** essa tokenização não é subword/BPE; palavras novas podem virar `<UNK>`, e sequências de pontuação podem ficar presas a palavras. Ela foi mantida nesta etapa para comparar a mudança arquitetural sem misturá-la a uma mudança de tokenizador. Antes de comparar capacidade linguística de forma conclusiva, a próxima melhoria importante é introduzir um tokenizador subword e retreinar.
+
+Para criar/atualizar o dicionário explicitamente:
 
 ```bash
 python create_ids.py data/dataset.json --output data/dictionary.json
@@ -41,75 +60,72 @@ python create_ids.py data/dataset.json --output data/dictionary.json
 
 ## Treinamento
 
-Exemplo:
+Exemplo para GPU CUDA:
 
 ```bash
-python train.py --dataset data/dataset.json --steps 2000 --seq-len 256 --batch-size 2
+python train.py \
+  --dataset data/dataset.json \
+  --dictionary data/dictionary.json \
+  --dim 512 --layers 8 --heads 8 --kv-heads 4 \
+  --seq-len 256 --batch-size 2 --steps 2000 \
+  --lr 3e-4 --lr-schedule warmup_cosine
 ```
 
-O treinamento usa:
+Em CPU, use `--device cpu --dtype float32`. O padrão `float16` do treinamento requer CUDA.
 
-- parâmetros mestre em FP32 com AdamW;
-- warmup + decaimento cosine;
+O treinamento inclui:
+
+- AdamW com cópias mestre FP32 dos parâmetros;
 - clipping de gradiente;
-- batches embaralhados sem reposição;
+- agendamento de learning rate constante ou warmup + cosine;
+- embaralhamento das amostras por época sem reposição;
 - batches parciais no fim de cada época;
-- padding dinâmico por batch para evitar computação desnecessária;
-- pesos diferentes para raciocínio e resposta;
-- fingerprint do dicionário no checkpoint para impedir incompatibilidade silenciosa.
+- padding dinâmico por batch;
+- pesos configuráveis para raciocínio e resposta;
+- validação de versão da arquitetura e fingerprint do dicionário ao retomar um checkpoint.
+
+Por padrão, a loss é calculada nas seções de raciocínio e resposta, não no prompt. Os pesos são configuráveis por `--think-weight` e `--answer-weight`.
+
+### Checkpoints
+
+A v6 incrementa `architecture_version` para 6. Checkpoints da v5 não são estruturalmente compatíveis: execute um treinamento novo, usando `--no-resume` quando o arquivo de saída contiver um checkpoint antigo.
 
 ## Inferência
 
 ```bash
-python infer.py --model lln_model.pt --prompt "eu gosto de" --new-tokens 128
+python infer.py \
+  --model lln_model.pt \
+  --dictionary data/dictionary.json \
+  --prompt "eu gosto de" \
+  --new-tokens 128
 ```
 
-A geração usa **KV cache** quando o prompt + geração cabem no contexto máximo. Nesse caminho, apenas o token novo passa pela rede a cada passo, evitando recalcular toda a sequência.
+A inferência usa KV cache quando prompt + tokens solicitados cabem no contexto configurado. O cache guarda K/V com o número reduzido de cabeças GQA; a geração sem cache serve como caminho de referência para testes.
 
-Para checkpoints ou dicionários em outros caminhos:
+## Diagnóstico e testes
 
-```bash
-python infer.py --model caminho/modelo.pt --dictionary caminho/dictionary.json
-```
-
-O carregador valida a versão da arquitetura e, em checkpoints recentes, o fingerprint do dicionário.
-
-## Diagnóstico
-
-O `debug_train.py` compara aprendizado no conjunto de treino e em exemplos mantidos fora do treino, além de verificar causalidade, gradientes, previsões teacher-forced e geração autoregressiva.
+`debug_train.py` compara aprendizado no conjunto de treino e em exemplos separados, além de verificar causalidade, gradientes, previsões teacher-forced e geração autoregressiva.
 
 ```bash
 python debug_train.py --dataset data/dataset.json --dictionary data/dictionary.json
-```
-
-## Testes
-
-O projeto possui um smoke test que verifica:
-
-- equivalência básica entre geração com e sem cache;
-- shape e finitude da loss;
-- padding dinâmico;
-- fingerprint do dicionário;
-- fluxo de gradiente dos especialistas.
-
-Execute:
-
-```bash
 python tests/smoke_test.py
 ```
 
-O mesmo teste é executado automaticamente pelo GitHub Actions em pushes para `main`/branches `auto/**` e em pull requests.
+Os smoke tests cobrem:
 
-## Experimentos de estrutura
+- equivalência da geração com e sem KV cache;
+- shape do cache compacto GQA;
+- finitude da loss e dos gradientes;
+- loss com pesos de tokens;
+- padding dinâmico;
+- fingerprint do dicionário;
+- compartilhamento de pesos entre embedding e cabeça de linguagem.
 
-`build_structure.py` continua separado como experimento para agrupar tokens por contexto e construir uma família estrutural dedicada a números. Essa informação ainda não é forçada dentro do embedding principal da LLN; isso permite comparar a hipótese estrutural com uma baseline sem contaminar o modelo.
+O GitHub Actions executa os smoke tests em pushes para `main` e branches `auto/**`, além de pull requests.
 
 ## Próximos experimentos
 
-As próximas otimizações mais interessantes são comparar sistematicamente:
-
-1. IDs puramente lexicais vs. IDs com estrutura semântica explícita;
-2. `recurrent_steps=1/2/3`;
-3. diferentes pesos de `<THINK>` e `<ANSWER>`;
-4. memória latente ativada somente no raciocínio vs. memória recorrente geral;
-5. qualidade de generalização e custo de inferência após cada mudança.
+1. Substituir a tokenização por espaços por um tokenizador subword, medindo cobertura e taxa de `<UNK>`.
+2. Estabelecer uma baseline de validação reproduzível antes de reintroduzir componentes experimentais.
+3. Comparar, um por vez, a memória latente, os especialistas low-rank e a recorrência contra a v6 densa.
+4. Medir loss de validação, qualidade da geração, tokens/s e pico de memória com os mesmos dados e orçamento de treino.
