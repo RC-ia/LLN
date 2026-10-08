@@ -33,11 +33,8 @@ class RotaryEmbedding(nn.Module):
             raise ValueError("RoPE requires an even attention head dimension")
         if theta <= 0:
             raise ValueError("rope_theta must be positive")
-        inv_freq = 1.0 / (
-            theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim)
-        )
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
         self.head_dim = head_dim
+        self.theta = float(theta)
 
     def forward(
         self, q: torch.Tensor, k: torch.Tensor, position_offset: int = 0
@@ -47,9 +44,15 @@ class RotaryEmbedding(nn.Module):
             position_offset,
             position_offset + seq_len,
             device=q.device,
-            dtype=self.inv_freq.dtype,
+            dtype=torch.float32,
         )
-        freqs = torch.outer(positions, self.inv_freq.to(device=q.device))
+        inv_freq = 1.0 / (
+            self.theta ** (
+                torch.arange(0, self.head_dim, 2, device=q.device, dtype=torch.float32)
+                / self.head_dim
+            )
+        )
+        freqs = torch.outer(positions, inv_freq)
         angles = torch.cat((freqs, freqs), dim=-1)[None, None, :, :]
         cos = angles.cos().to(dtype=q.dtype)
         sin = angles.sin().to(dtype=q.dtype)
