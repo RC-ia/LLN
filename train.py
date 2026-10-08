@@ -103,6 +103,9 @@ def main():
     parser.add_argument("--dim", type=int, default=512)
     parser.add_argument("--layers", type=int, default=8)
     parser.add_argument("--heads", type=int, default=8)
+    parser.add_argument("--kv-heads", type=int, default=4, help="Number of key/value heads for GQA")
+    parser.add_argument("--rope-theta", type=float, default=10000.0)
+    parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--seq-len", type=int, default=256, help="Maximum context per training example")
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--steps", type=int, default=2000, help="Additional steps to run")
@@ -117,9 +120,6 @@ def main():
     parser.add_argument("--warmup-steps", type=int, default=100)
     parser.add_argument("--think-weight", type=float, default=0.25)
     parser.add_argument("--answer-weight", type=float, default=1.0)
-    parser.add_argument("--recurrent-steps", type=int, default=2)
-    parser.add_argument("--output-clusters", type=int, default=120)
-    parser.add_argument("--memory-slots", type=int, default=4)
     parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument("--save", default="lln_model.pt")
     parser.add_argument("--repeats", type=int, default=2000)
@@ -135,12 +135,12 @@ def main():
         raise ValueError("--warmup-steps must be >= 0")
     if args.min_lr <= 0.0 or args.min_lr > args.lr:
         raise ValueError("--min-lr must be > 0 and <= --lr")
-    if args.recurrent_steps < 1:
-        raise ValueError("--recurrent-steps must be >= 1")
-    if args.output_clusters < 1:
-        raise ValueError("--output-clusters must be >= 1")
-    if args.memory_slots < 1:
-        raise ValueError("--memory-slots must be >= 1")
+    if args.kv_heads < 1 or args.heads % args.kv_heads:
+        raise ValueError("--kv-heads must be positive and divide --heads")
+    if args.rope_theta <= 0:
+        raise ValueError("--rope-theta must be positive")
+    if not 0.0 <= args.dropout < 1.0:
+        raise ValueError("--dropout must be in [0, 1)")
 
     if args.device == "auto":
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -161,7 +161,7 @@ def main():
         max_len=args.seq_len,
         return_sections=True,
     )
-    word_to_id, _, token_types, dictionary_meta = load_dictionary(args.dictionary, with_metadata=True)
+    word_to_id, _, _, dictionary_meta = load_dictionary(args.dictionary, with_metadata=True)
     dictionary_hash = dictionary_fingerprint(word_to_id)
 
     model_cfg = {
@@ -169,11 +169,10 @@ def main():
         "dim": args.dim,
         "layers": args.layers,
         "heads": args.heads,
+        "kv_heads": args.kv_heads,
         "max_seq_len": args.seq_len,
-        "recurrent_steps": args.recurrent_steps,
-        "output_clusters": args.output_clusters,
-        "memory_slots": args.memory_slots,
-        "type_count": int(dictionary_meta.get("type_count", 6)),
+        "dropout": args.dropout,
+        "rope_theta": args.rope_theta,
     }
 
     save_path = Path(args.save)
@@ -212,7 +211,6 @@ def main():
             checkpoint_cursor = int(checkpoint.get("epoch_cursor", 0))
 
     model = LLN(**model_cfg).to(device=device, dtype=dtype)
-    model.set_token_types(token_types)
     if checkpoint is not None:
         model.load_state_dict(checkpoint["model"])
 
@@ -256,8 +254,8 @@ def main():
     print(f"master_weight_size={master_mb:.1f} MB")
     print(f"vocab={len(word_to_id):,} records={len(data):,}")
     print(f"seq_len={args.seq_len} batch_size={args.batch_size}")
-    print(f"recurrent_steps={args.recurrent_steps} output_clusters={args.output_clusters} memory_slots={args.memory_slots}")
-    print(f"token_types={model_cfg['type_count']} dictionary_metadata={dictionary_meta.get('version', 1)}")
+    print(f"attention_heads={args.heads} kv_heads={args.kv_heads} rope_theta={args.rope_theta:g}")
+    print(f"dictionary_metadata_version={dictionary_meta.get('version', 1)}")
     print(f"loss_weights=prompt:0 think:{args.think_weight:g} answer:{args.answer_weight:g}")
     print("long_record_policy=preserve_prompt_and_answer_truncate_think")
     print("optimizer=AdamW fp32_master_params")
