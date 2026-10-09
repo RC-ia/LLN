@@ -307,7 +307,7 @@ def main():
     print(f"device={device} dtype={dtype}")
     print(f"parameters={parameter_count(model):,}")
     print(f"model_weight_size={parameter_size_mb(model, torch.tensor([], dtype=dtype).element_size()):.1f} MB")
-    print(f"vocab={len(word_to_id):,} dataset_records={len(records):,}")
+    print(f"vocab={word_to_id.get_vocab_size():,} dataset_records={len(records):,}")
     print(f"train_examples={len(train_encoded)} heldout_examples={len(eval_encoded)}")
     print(f"batch_size={args.batch_size} seq_len={args.seq_len} steps={args.steps} lr={args.lr:g}")
     print(f"attention_heads={args.heads} kv_heads={args.kv_heads} rope_theta={args.rope_theta:g}")
@@ -321,7 +321,7 @@ def main():
     print("\n=== INITIAL METRICS ===")
     print_metrics("TRAIN", initial_train_metrics)
     print_metrics("HELDOUT", initial_eval_metrics)
-    print(f"baseline_ln_vocab={math.log(len(word_to_id)):.6f}")
+    print(f"baseline_ln_vocab={math.log(word_to_id.get_vocab_size()):.6f}")
     if initial_train_example is not None:
         print_top_predictions(initial_train_example[3], initial_train_example[1], initial_train_example[2], id_to_word)
     print(f"causality_max_abs_diff={causality_check(model, x0):.6g}")
