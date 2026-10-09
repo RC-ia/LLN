@@ -272,7 +272,7 @@ def main():
         raise RuntimeError("CUDA requested but unavailable")
     dtype = pick_dtype(args.dtype)
 
-    word_to_id, id_to_word, _, meta = load_dictionary(args.dictionary, with_metadata=True)
+    word_to_id, id_to_word, _, _ = load_dictionary(args.dictionary, with_metadata=True)
     records = load_records(args.dataset)
     required = args.examples + args.eval_examples
     if len(records) < required:
