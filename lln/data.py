@@ -60,7 +60,10 @@ def classify_token(token: str) -> int:
 
 def tokenizer_fingerprint(tokenizer: Tokenizer) -> str:
     """Fingerprint vocabulary, merges, pre-tokenization, decoder and special tokens."""
-    payload = tokenizer.to_str()
+    state = json.loads(tokenizer.to_str())
+    payload = json.dumps(
+        state, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
