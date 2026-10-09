@@ -1,7 +1,7 @@
 import argparse
 import torch
 
-from lln.data import decode_ids, dictionary_fingerprint, encode_prompt, load_dictionary
+from lln.data import decode_ids, encode_prompt, load_tokenizer, token_id, tokenizer_fingerprint
 from lln.model import LLN
 
 
@@ -17,7 +17,8 @@ def checkpoint_dtype(checkpoint) -> torch.dtype:
 def main():
     parser = argparse.ArgumentParser(description="Generate text from an LLN checkpoint")
     parser.add_argument("--model", default="lln_model.pt")
-    parser.add_argument("--dictionary", default="data/dictionary.json")
+    parser.add_argument("--tokenizer", "--dictionary", dest="tokenizer", default="data/tokenizer.json",
+                        help="Path to the exact BPE tokenizer used for training")
     parser.add_argument("--prompt", default="eu gosto de")
     parser.add_argument("--new-tokens", type=int, default=128)
     parser.add_argument("--temperature", type=float, default=1.0)
@@ -42,33 +43,20 @@ def main():
 
     checkpoint = torch.load(args.model, map_location=device, weights_only=True)
     cfg = checkpoint["config"].copy()
-    word_to_id, id_to_word, _, dictionary_meta = load_dictionary(
-        args.dictionary, with_metadata=True
-    )
+    tokenizer, id_to_token = load_tokenizer(args.tokenizer)
     saved_architecture_version = cfg.get("architecture_version")
-    required_special_tokens = {
-        "<PAD>", "<BOS>", "<EOS>", "<UNK>",
-        "<USER>", "</USER>", "<THINK>", "</THINK>",
-        "<ANSWER>", "</ANSWER>",
-    }
-    missing_special_tokens = sorted(required_special_tokens.difference(word_to_id))
-    if missing_special_tokens:
-        raise ValueError(
-            "dictionary is stale or incompatible; missing special tokens: "
-            + ", ".join(missing_special_tokens)
-            + ". Rebuild it with create_ids.py or run train.py first."
-        )
-
     if saved_architecture_version is not None and saved_architecture_version != LLN.ARCHITECTURE_VERSION:
         raise ValueError(
             f"checkpoint architecture version {saved_architecture_version} does not match "
             f"runtime version {LLN.ARCHITECTURE_VERSION}"
         )
 
-    saved_dictionary_hash = cfg.get("dictionary_fingerprint")
-    if saved_dictionary_hash and saved_dictionary_hash != dictionary_fingerprint(word_to_id):
+    saved_tokenizer_hash = cfg.get("tokenizer_fingerprint")
+    if not saved_tokenizer_hash:
+        raise ValueError("checkpoint does not contain a tokenizer fingerprint; retrain with LLN v6")
+    if saved_tokenizer_hash != tokenizer_fingerprint(tokenizer):
         raise ValueError(
-            "dictionary does not match checkpoint: token IDs may refer to different words"
+            "tokenizer does not match checkpoint; use the exact tokenizer JSON from training"
         )
 
     model_keys = {
@@ -83,7 +71,7 @@ def main():
     model.eval()
 
     ids = torch.tensor(
-        [encode_prompt(args.prompt, word_to_id)],
+        [encode_prompt(args.prompt, tokenizer)],
         dtype=torch.long,
         device=device,
     )
@@ -93,7 +81,7 @@ def main():
         temperature=args.temperature,
         repetition_penalty=args.repetition_penalty,
         no_repeat_ngram_size=args.no_repeat_ngram,
-        stop_ids={word_to_id["</ANSWER>"], word_to_id["<EOS>"]},
+        stop_ids={token_id(tokenizer, "</ANSWER>"), token_id(tokenizer, "<EOS>")},
     )[0].tolist()
 
     print("architecture_version:", LLN.ARCHITECTURE_VERSION)
@@ -101,13 +89,15 @@ def main():
     print("attention_heads:", model.heads)
     print("kv_heads:", model.kv_heads)
     print("rope_theta:", model.rope_theta)
-    print("dictionary_metadata_version:", dictionary_meta.get("version", 1))
+    print("tokenizer:", args.tokenizer)
+    print("tokenizer_vocab_size:", tokenizer.get_vocab_size())
+    print("tokenizer_fingerprint:", tokenizer_fingerprint(tokenizer)[:12])
     print("temperature:", args.temperature)
     print("repetition_penalty:", args.repetition_penalty)
     print("no_repeat_ngram:", args.no_repeat_ngram)
     print("input_ids:", ids[0].tolist())
     print("output_ids:", out)
-    print("text:", decode_ids(out, id_to_word))
+    print("text:", decode_ids(out, tokenizer))
 
 
 if __name__ == "__main__":
