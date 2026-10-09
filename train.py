@@ -257,7 +257,7 @@ def main():
     print(f"tokenizer={args.tokenizer} fingerprint={tokenizer_hash[:12]}")
     print(f"seq_len={args.seq_len} batch_size={args.batch_size}")
     print(f"attention_heads={args.heads} kv_heads={args.kv_heads} rope_theta={args.rope_theta:g}")
-     print(f"loss_weights=prompt:0 think:{args.think_weight:g} answer:{args.answer_weight:g}")
+    print(f"loss_weights=prompt:0 think:{args.think_weight:g} answer:{args.answer_weight:g}")
     print("long_record_policy=preserve_prompt_and_answer_truncate_think")
     print("optimizer=AdamW fp32_master_params")
     print(f"architecture_version={ARCHITECTURE_VERSION}")
