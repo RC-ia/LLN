@@ -6,6 +6,7 @@ import torch
 
 from lln.data import (
     SPECIAL_TOKENS,
+    build_dataset,
     decode_ids,
     dictionary_fingerprint,
     encode_record,
@@ -156,6 +157,14 @@ def main():
         assert record_ids[1] == token_id(tokenizer, "<USER>")
         assert record_ids[-1] == token_id(tokenizer, "<EOS>")
         assert len(record_ids) == len(record_sections)
+
+        # Fresh training should bootstrap a persisted tokenizer only when absent.
+        bootstrap_path = tmp / "bootstrap-tokenizer.json"
+        bootstrap_data = build_dataset(
+            dataset_path, bootstrap_path, repeats=3, max_len=128
+        )
+        assert bootstrap_path.exists()
+        assert len(bootstrap_data) == 3
 
     # Feed-forward weights must participate in backpropagation.
     model.train()
