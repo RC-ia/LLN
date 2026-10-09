@@ -364,9 +364,29 @@ def make_batch(data, batch_size: int, seq_len: int, device, sections=None, indic
     return x, y, batch_sections
 
 def decode_ids(ids: list[int], tokenizer: Tokenizer) -> str:
-    """Decode BPE IDs into readable text, omitting registered control tokens."""
-    values = [int(idx) for idx in ids]
+    """Decode BPE IDs, treating control tokens as boundaries between text segments."""
+    chunks: list[str] = []
+    segment: list[int] = []
+
+    def flush_segment() -> None:
+        if segment:
+            chunks.append(tokenizer.decode(segment, skip_special_tokens=True))
+            segment.clear()
+
     try:
-        return tokenizer.decode(values, skip_special_tokens=True).strip()
+        for raw_id in ids:
+            idx = int(raw_id)
+            token = tokenizer.id_to_token(idx)
+            if token in SPECIAL_TOKENS:
+                flush_segment()
+                if token == "<EOS>":
+                    break
+                if token not in {"<PAD>", "<BOS>"}:
+                    # Control markers separate fields which were encoded individually.
+                    chunks.append(" ")
+            else:
+                segment.append(idx)
+        flush_segment()
+        return re.sub(r"\\s+", " ", "".join(chunks)).strip()
     except Exception as exc:
         raise ValueError("Could not decode IDs with the supplied LLN tokenizer") from exc
