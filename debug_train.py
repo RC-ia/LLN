@@ -13,7 +13,8 @@ from lln.data import (
     decode_ids,
     encode_prompt,
     encode_record,
-    load_dictionary,
+    load_tokenizer,
+    token_id,
     load_records,
     make_batch,
 )
@@ -221,15 +222,16 @@ def generation_test(model, record, word_to_id, id_to_word, device, max_new_token
         frequency_penalty=0.08,
         presence_penalty=0.20,
         hard_repeat_threshold=6,
-        stop_ids={word_to_id.get("<EOS>", 2)},
+        stop_ids={token_id(word_to_id, "<EOS>")},
     )
-    return decode_ids(out[0].detach().cpu().tolist(), id_to_word)
+    return decode_ids(out[0].detach().cpu().tolist(), word_to_id)
 
 
 def main():
     parser = argparse.ArgumentParser(description="LLN diagnostic suite: full-dataset learning, held-out generalization and autoregressive behavior")
     parser.add_argument("--dataset", default="data/dataset.json")
-    parser.add_argument("--dictionary", default="data/dictionary.json")
+    parser.add_argument("--tokenizer", "--dictionary", dest="tokenizer", default="data/tokenizer.json",
+                        help="Path to the saved ByteLevel BPE tokenizer")
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
     parser.add_argument("--dtype", default="float32", choices=["float32", "float16", "bfloat16"])
     parser.add_argument("--dim", type=int, default=256)
@@ -272,7 +274,7 @@ def main():
         raise RuntimeError("CUDA requested but unavailable")
     dtype = pick_dtype(args.dtype)
 
-    word_to_id, id_to_word, _, _ = load_dictionary(args.dictionary, with_metadata=True)
+    word_to_id, id_to_word = load_tokenizer(args.tokenizer)
     records = load_records(args.dataset)
     required = args.examples + args.eval_examples
     if len(records) < required:
@@ -287,7 +289,7 @@ def main():
     x0, y0, sections0 = batch_from_indices(train_encoded, [0], 1, device, args.seq_len)
 
     model_cfg = {
-        "vocab_size": len(word_to_id),
+        "vocab_size": word_to_id.get_vocab_size(),
         "dim": args.dim,
         "layers": args.layers,
         "heads": args.heads,
@@ -305,7 +307,7 @@ def main():
     print(f"device={device} dtype={dtype}")
     print(f"parameters={parameter_count(model):,}")
     print(f"model_weight_size={parameter_size_mb(model, torch.tensor([], dtype=dtype).element_size()):.1f} MB")
-    print(f"vocab={len(word_to_id):,} dataset_records={len(records):,}")
+    print(f"vocab={word_to_id.get_vocab_size():,} dataset_records={len(records):,}")
     print(f"train_examples={len(train_encoded)} heldout_examples={len(eval_encoded)}")
     print(f"batch_size={args.batch_size} seq_len={args.seq_len} steps={args.steps} lr={args.lr:g}")
     print(f"attention_heads={args.heads} kv_heads={args.kv_heads} rope_theta={args.rope_theta:g}")
@@ -319,7 +321,7 @@ def main():
     print("\n=== INITIAL METRICS ===")
     print_metrics("TRAIN", initial_train_metrics)
     print_metrics("HELDOUT", initial_eval_metrics)
-    print(f"baseline_ln_vocab={math.log(len(word_to_id)):.6f}")
+    print(f"baseline_ln_vocab={math.log(word_to_id.get_vocab_size()):.6f}")
     if initial_train_example is not None:
         print_top_predictions(initial_train_example[3], initial_train_example[1], initial_train_example[2], id_to_word)
     print(f"causality_max_abs_diff={causality_check(model, x0):.6g}")
