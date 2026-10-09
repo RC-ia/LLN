@@ -1,27 +1,16 @@
 # LLN — Linguistic Learning Network
 
-LLN é um experimento de modelo de linguagem autoregressivo em PyTorch. A versão 6 adota uma arquitetura **Transformer decoder-only densa**, inspirada em componentes usados nas famílias Llama e SmolLM.
+LLN é um modelo de linguagem autoregressivo em PyTorch. A versão 6 usa um **Transformer decoder-only denso**, inspirado em componentes usados nas famílias Llama e SmolLM, e tokenização **ByteLevel BPE** baseada na biblioteca Hugging Face Tokenizers.
 
 ## Arquitetura v6
 
-Fluxo principal:
-
 ```text
-IDs → token embeddings → Transformer blocks → RMSNorm → LM head → próximo token
+texto → ByteLevel BPE → token IDs → Transformer → logits → próximo token
 ```
 
-Cada bloco usa:
+Cada bloco usa RoPE, Grouped-Query Attention (GQA), RMSNorm, SwiGLU e conexões residuais. A cabeça de linguagem compartilha os pesos com a matriz de embeddings. A inferência utiliza KV cache compacto com o número reduzido de cabeças K/V.
 
-- **RoPE (Rotary Position Embeddings)** para codificar posições dentro da atenção;
-- **Grouped-Query Attention (GQA)**, com menos cabeças de K/V do que cabeças de consulta;
-- **RMSNorm** antes da atenção e do MLP;
-- **SwiGLU** como feed-forward;
-- conexões residuais e projeções lineares sem bias;
-- KV cache compacto para a geração autoregressiva.
-
-A cabeça de linguagem compartilha os pesos com a matriz de embeddings dos tokens (*weight tying*).
-
-Os mecanismos experimentais da v5 — recorrência dos blocos, banco de especialistas low-rank, memória latente de raciocínio e embedding de clusters — não fazem parte da baseline v6. Eles poderão voltar em experimentos isolados, desde que o ganho seja medido contra essa baseline.
+Os mecanismos experimentais da v5 — recorrência de blocos, especialistas low-rank, memória latente de raciocínio e embedding de clusters — ficam fora da baseline densa. Podem voltar em experimentos isolados após comparação com a baseline.
 
 ### Configuração padrão
 
@@ -33,13 +22,14 @@ Os mecanismos experimentais da v5 — recorrência dos blocos, banco de especial
 | Cabeças K/V | 4 |
 | Contexto de treinamento | 256 tokens |
 | RoPE theta | 10.000 |
+| Tamanho-alvo do vocabulário BPE | 8.000 |
 | Dropout | 0,0 |
 
-Os valores são configuráveis pela linha de comando. A implementação exige que a dimensão seja divisível pelo número de cabeças, que a dimensão por cabeça seja par e que o número de cabeças de consulta seja divisível pelo número de cabeças K/V.
+## Tokenizador e dados
 
-## Dataset e dicionário
+O pipeline usa um tokenizador **ByteLevel BPE**. Ao contrário da divisão por espaços, ele pode decompor palavras desconhecidas em subpalavras e bytes, mantendo cobertura para pontuação, acentos, emojis e outros caracteres Unicode. A normalização textual atual continua convertendo para minúsculas e compactando espaços; a mudança para BPE não altera essa política de normalização.
 
-O dataset JSON aceita mensagens `user` e `assistant`, com `reasoning_content` opcional. O pipeline usa os marcadores:
+Os tokens de controle são reservados no início do vocabulário com IDs fixos:
 
 ```text
 <PAD> <BOS> <EOS> <UNK>
@@ -48,15 +38,18 @@ O dataset JSON aceita mensagens `user` e `assistant`, com `reasoning_content` op
 <ANSWER> </ANSWER>
 ```
 
-O pipeline atual normaliza o texto para minúsculas e faz a tokenização por espaços. O dicionário é reconstruído a partir do dataset durante o treinamento, e o checkpoint guarda uma impressão digital do mapeamento de IDs para detectar incompatibilidades.
-
-**Limitação conhecida:** essa tokenização não é subword/BPE; palavras novas podem virar `<UNK>`, e sequências de pontuação podem ficar presas a palavras. Ela foi mantida nesta etapa para comparar a mudança arquitetural sem misturá-la a uma mudança de tokenizador. Antes de comparar capacidade linguística de forma conclusiva, a próxima melhoria importante é introduzir um tokenizador subword e retreinar.
-
-Para criar/atualizar o dicionário explicitamente:
+### Instalação e treinamento do tokenizador
 
 ```bash
-python create_ids.py data/dataset.json --output data/dictionary.json
+pip install -r requirements.txt
+python create_ids.py data/dataset.json --output data/tokenizer.json --vocab-size 8000
 ```
+
+O arquivo `data/tokenizer.json` contém o vocabulário, as regras BPE, o pré-tokenizador, o decoder e os tokens especiais. **Guarde e reutilize exatamente esse arquivo** no treinamento, diagnóstico e inferência. Se um checkout não tiver o arquivo, `train.py` treina um tokenizador automaticamente na primeira execução; para maior reprodutibilidade, crie-o explicitamente antes de treinar.
+
+Para corpus menor, `--vocab-size` e `--min-frequency` podem ser ajustados. O tamanho-alvo mínimo é suficiente para os tokens especiais e o alfabeto completo de bytes. Um checkpoint guarda um fingerprint da serialização completa do tokenizador (não apenas dos IDs) e a inferência rejeita um tokenizador diferente.
+
+O dataset JSON aceita mensagens `user` e `assistant`, além de `reasoning_content` opcional. A tokenização aplica-se ao conteúdo textual; os marcadores de controle são inseridos como tokens especiais explícitos no pipeline.
 
 ## Treinamento
 
@@ -65,67 +58,50 @@ Exemplo para GPU CUDA:
 ```bash
 python train.py \
   --dataset data/dataset.json \
-  --dictionary data/dictionary.json \
+  --tokenizer data/tokenizer.json \
   --dim 512 --layers 8 --heads 8 --kv-heads 4 \
   --seq-len 256 --batch-size 2 --steps 2000 \
   --lr 3e-4 --lr-schedule warmup_cosine
 ```
 
+O argumento legado `--dictionary` ainda é aceito como alias de `--tokenizer`, mas o arquivo indicado precisa ser um tokenizer JSON BPE, não o antigo dicionário lexical.
+
 Em CPU, use `--device cpu --dtype float32`. O padrão `float16` do treinamento requer CUDA.
 
-O treinamento inclui:
-
-- AdamW com cópias mestre FP32 dos parâmetros;
-- clipping de gradiente;
-- agendamento de learning rate constante ou warmup + cosine;
-- embaralhamento das amostras por época sem reposição;
-- batches parciais no fim de cada época;
-- padding dinâmico por batch;
-- pesos configuráveis para raciocínio e resposta;
-- validação de versão da arquitetura e fingerprint do dicionário ao retomar um checkpoint.
+O treinamento inclui AdamW com parâmetros mestre FP32, clipping de gradiente, agendamento de learning rate opcional, amostragem embaralhada por época, batches parciais, padding dinâmico e pesos configuráveis para raciocínio/resposta. Checkpoints validam versão da arquitetura, configuração e fingerprint do tokenizador antes de retomar.
 
 Por padrão, a loss é calculada nas seções de raciocínio e resposta, não no prompt. Os pesos são configuráveis por `--think-weight` e `--answer-weight`.
 
 ### Checkpoints
 
-A v6 incrementa `architecture_version` para 6. Checkpoints da v5 não são estruturalmente compatíveis: execute um treinamento novo, usando `--no-resume` quando o arquivo de saída contiver um checkpoint antigo.
+A v6 define `architecture_version=6`. Checkpoints v5 não são estruturalmente compatíveis; inicie um treinamento novo, usando `--no-resume` se o caminho de saída já contiver um checkpoint antigo.
 
 ## Inferência
 
 ```bash
 python infer.py \
   --model lln_model.pt \
-  --dictionary data/dictionary.json \
+  --tokenizer data/tokenizer.json \
   --prompt "eu gosto de" \
   --new-tokens 128
 ```
 
-A inferência usa KV cache quando prompt + tokens solicitados cabem no contexto configurado. O cache guarda K/V com o número reduzido de cabeças GQA; a geração sem cache serve como caminho de referência para testes.
+A inferência valida o fingerprint do tokenizador antes de gerar texto. O KV cache é usado quando o prompt e a geração solicitada cabem no contexto configurado. Tokens especiais de controle são removidos da saída textual decodificada.
 
 ## Diagnóstico e testes
 
-`debug_train.py` compara aprendizado no conjunto de treino e em exemplos separados, além de verificar causalidade, gradientes, previsões teacher-forced e geração autoregressiva.
+`debug_train.py` mede aprendizado e generalização em amostras separadas, além de verificar gradientes, alinhamento de tokens e geração autoregressiva.
 
 ```bash
-python debug_train.py --dataset data/dataset.json --dictionary data/dictionary.json
+python debug_train.py --dataset data/dataset.json --tokenizer data/tokenizer.json
 python tests/smoke_test.py
 ```
 
-Os smoke tests cobrem:
-
-- equivalência da geração com e sem KV cache;
-- shape do cache compacto GQA;
-- finitude da loss e dos gradientes;
-- loss com pesos de tokens;
-- padding dinâmico;
-- fingerprint do dicionário;
-- compartilhamento de pesos entre embedding e cabeça de linguagem.
-
-O GitHub Actions executa os smoke tests em pushes para `main` e branches `auto/**`, além de pull requests.
+Os smoke tests cobrem equivalência da geração com e sem KV cache, causalidade da atenção, shape do cache GQA, finitude da loss e dos gradientes, padding dinâmico, fingerprint e treino/carregamento do tokenizador BPE, preservação de texto fora do vocabulário e IDs dos tokens especiais.
 
 ## Próximos experimentos
 
-1. Substituir a tokenização por espaços por um tokenizador subword, medindo cobertura e taxa de `<UNK>`.
-2. Estabelecer uma baseline de validação reproduzível antes de reintroduzir componentes experimentais.
-3. Comparar, um por vez, a memória latente, os especialistas low-rank e a recorrência contra a v6 densa.
-4. Medir loss de validação, qualidade da geração, tokens/s e pico de memória com os mesmos dados e orçamento de treino.
+1. Avaliar vocabulários BPE de 4k, 8k e 16k usando taxa de compressão, tamanho efetivo das sequências, loss de validação e qualidade de geração.
+2. Criar um conjunto de validação fixo e garantir que nenhum exemplo de avaliação entre no treino.
+3. Comparar a baseline com a memória latente, os especialistas low-rank e a recorrência, um componente de cada vez.
+4. Medir loss de validação, cobertura textual, tokens/s e pico de memória com o mesmo orçamento de treinamento.
