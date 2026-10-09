@@ -126,7 +126,19 @@ def main():
     parser.add_argument("--repeats", type=int, default=2000)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--no-resume", action="store_true")
+    parser.add_argument(
+        "--architecture",
+        choices=["v6-standard", "v7-center-test"],
+        default="v6-standard",
+        help="Architecture tag. v7-center-test selects a 12-layer preset with six expanded central FFNs.",
+    )
     args = parser.parse_args()
+
+    if args.architecture == "v7-center-test":
+        # Fixed experimental preset sized to remain near the v6 parameter budget.
+        args.dim, args.layers, args.heads, args.kv_heads = 768, 12, 12, 4
+
+    expected_architecture_version = 7 if args.architecture == "v7-center-test" else 6
 
     if args.seq_len < 8:
         raise ValueError("--seq-len must be at least 8")
@@ -175,6 +187,8 @@ def main():
         "dropout": args.dropout,
         "rope_theta": args.rope_theta,
     }
+    if args.architecture == "v7-center-test":
+        model_cfg["architecture_variant"] = "v7-center-test"
 
     save_path = Path(args.save)
     checkpoint = None
@@ -195,8 +209,8 @@ def main():
         elif saved_cfg.get("tokenizer_fingerprint") != tokenizer_hash:
             print("checkpoint tokenizer differs from current tokenizer; starting a new model")
             checkpoint = None
-        elif saved_cfg.get("architecture_version") != ARCHITECTURE_VERSION:
-            print("checkpoint uses an older architecture; starting a new model")
+        elif saved_cfg.get("architecture_version") != expected_architecture_version:
+            print("checkpoint uses a different architecture version; starting a new model")
             checkpoint = None
         elif saved_cfg.get("loss_scheme_version") != LOSS_SCHEME_VERSION:
             print("checkpoint uses an older training objective; starting a new model")
@@ -260,7 +274,8 @@ def main():
     print(f"loss_weights=prompt:0 think:{args.think_weight:g} answer:{args.answer_weight:g}")
     print("long_record_policy=preserve_prompt_and_answer_truncate_think")
     print("optimizer=AdamW fp32_master_params")
-    print(f"architecture_version={ARCHITECTURE_VERSION}")
+    print(f"architecture_tag={args.architecture} dim={args.dim} layers={args.layers}")
+    print(f"architecture_version={expected_architecture_version}")
     if args.lr_schedule == "constant":
         print(f"training_schedule=constant lr:{args.lr:g}")
     else:
@@ -391,7 +406,7 @@ def main():
             "tokenizer_fingerprint": tokenizer_hash,
             "dataset": str(args.dataset),
             "loss_scheme_version": LOSS_SCHEME_VERSION,
-            "architecture_version": ARCHITECTURE_VERSION,
+            "architecture_version": expected_architecture_version,
             "think_weight": args.think_weight,
             "answer_weight": args.answer_weight,
             "dtype": str(dtype),
