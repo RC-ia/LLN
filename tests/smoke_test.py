@@ -157,6 +157,7 @@ def main():
         assert record_ids[1] == token_id(tokenizer, "<USER>")
         assert record_ids[-1] == token_id(tokenizer, "<EOS>")
         assert len(record_ids) == len(record_sections)
+        assert decode_ids(record_ids, tokenizer) == f"{record[0]} {record[2]}"
 
         # Fresh training should bootstrap a persisted tokenizer only when absent.
         bootstrap_path = tmp / "bootstrap-tokenizer.json"
