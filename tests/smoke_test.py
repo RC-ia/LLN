@@ -1,6 +1,22 @@
+import json
+import tempfile
+from pathlib import Path
+
 import torch
 
-from lln.data import make_batch, dictionary_fingerprint
+from lln.data import (
+    SPECIAL_TOKENS,
+    decode_ids,
+    dictionary_fingerprint,
+    encode_record,
+    encode_text,
+    load_tokenizer,
+    make_batch,
+    normalize_text,
+    token_id,
+    tokenizer_fingerprint,
+    train_tokenizer_from_dataset,
+)
 from lln.model import LLN, parameter_count
 
 
@@ -92,6 +108,54 @@ def main():
     fp1 = dictionary_fingerprint({"a": 0, "b": 1})
     fp2 = dictionary_fingerprint({"a": 0, "b": 2})
     assert fp1 != fp2
+
+    # BPE must preserve the special-token ID contract and encode unseen words
+    # from byte/subword pieces instead of mapping the whole word to <UNK>.
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        dataset_path = tmp / "dataset.json"
+        tokenizer_path = tmp / "tokenizer.json"
+        dataset_path.write_text(
+            json.dumps(
+                [
+                    {"messages": [
+                        {"role": "user", "content": "Olá! Como você está?"},
+                        {"role": "assistant", "content": "Estou bem; tokenização funciona."},
+                    ]},
+                    {"messages": [
+                        {"role": "user", "content": "Explique modelos pequenos."},
+                        {"role": "assistant", "content": "Modelos podem aprender padrões."},
+                    ]},
+                    {"messages": [
+                        {"role": "user", "content": "2 + 2"},
+                        {"role": "assistant", "content": "4."},
+                    ]},
+                ],
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        trained = train_tokenizer_from_dataset(
+            dataset_path, tokenizer_path, vocab_size=300, min_frequency=1
+        )
+        tokenizer, id_to_token = load_tokenizer(tokenizer_path)
+        assert tokenizer.get_vocab_size() >= 266
+        for expected_id, special in enumerate(SPECIAL_TOKENS):
+            assert token_id(tokenizer, special) == expected_id
+        assert tokenizer_fingerprint(trained) == tokenizer_fingerprint(tokenizer)
+
+        unseen = "Xylophone-unseen tokenização-improvável 🧠"
+        unseen_ids = encode_text(unseen, tokenizer)
+        assert token_id(tokenizer, "<UNK>") not in unseen_ids
+        assert decode_ids(unseen_ids, tokenizer) == normalize_text(unseen)
+        assert all(token in id_to_token for token in unseen_ids)
+
+        record = (normalize_text("Pergunta inédita"), None, normalize_text("Resposta inédita!"))
+        record_ids, record_sections = encode_record(record, tokenizer)
+        assert record_ids[0] == token_id(tokenizer, "<BOS>")
+        assert record_ids[1] == token_id(tokenizer, "<USER>")
+        assert record_ids[-1] == token_id(tokenizer, "<EOS>")
+        assert len(record_ids) == len(record_sections)
 
     # Feed-forward weights must participate in backpropagation.
     model.train()
