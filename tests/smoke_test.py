@@ -1,7 +1,7 @@
 import torch
 
 from lln.data import make_batch, dictionary_fingerprint
-from lln.model import LLN
+from lln.model import LLN, parameter_count
 
 
 def main():
@@ -13,20 +13,21 @@ def main():
         dim=32,
         layers=2,
         heads=4,
+        kv_heads=2,
         max_seq_len=16,
-        recurrent_steps=2,
-        output_clusters=4,
-        memory_slots=2,
-        type_count=6,
+        dropout=0.0,
+        rope_theta=10000.0,
     )
-
-    token_types = [0, 1, 1, 1, 1, 1] + [2] * (vocab_size - 6)
-    model.set_token_types(token_types)
 
     ids = torch.tensor(
         [[1, 4, 8, 6, 10, 7], [1, 5, 9, 6, 11, 7]],
         dtype=torch.long,
     )
+
+    # The architecture must use fewer KV heads than query heads for this GQA case.
+    assert model.blocks[0].self_attn.heads == 4
+    assert model.blocks[0].self_attn.kv_heads == 2
+    assert parameter_count(model) > 0
 
     model.eval()
     with torch.no_grad():
@@ -54,11 +55,29 @@ def main():
             hard_repeat_threshold=100,
             stop_ids={23},
         )
-        assert torch.equal(full, cached), f"cached generation diverged: {full} != {cached}"
+        assert torch.equal(full, cached), (
+            f"cached generation diverged: {full.tolist()} != {cached.tolist()}"
+        )
+
+        _, caches = model._prefill_cache(ids)
+        assert len(caches) == 2
+        assert caches[0][0].shape == (2, 2, 16, 8)
+        assert caches[0][1].shape == (2, 2, 16, 8)
 
         logits, loss = model(ids, ids)
         assert logits.shape == (ids.size(0), ids.size(1), vocab_size)
-        assert torch.isfinite(loss)
+        assert loss is not None and torch.isfinite(loss)
+
+        # Future tokens must not influence logits at earlier causal positions.
+        changed = ids.clone()
+        changed[:, 4:] = torch.flip(changed[:, 4:], dims=[1])
+        changed_logits, _ = model(changed)
+        assert torch.allclose(logits[:, :4], changed_logits[:, :4], atol=1e-5, rtol=1e-5)
+
+        weights = torch.ones_like(ids, dtype=torch.float32)
+        weights[:, :2] = 0.0
+        _, weighted_loss = model(ids, ids, loss_weights=weights)
+        assert weighted_loss is not None and torch.isfinite(weighted_loss)
 
     # Dynamic batching should avoid padding every batch to the global seq_len.
     examples = [
@@ -74,13 +93,20 @@ def main():
     fp2 = dictionary_fingerprint({"a": 0, "b": 2})
     assert fp1 != fp2
 
-    # Specialist branches must participate in the first backward pass.
+    # Feed-forward weights must participate in backpropagation.
     model.train()
     _, loss = model(ids, ids)
+    assert loss is not None
     loss.backward()
-    assert model.blocks[0].specialists.experts[0].down.weight.grad is not None
+    assert model.blocks[0].mlp.gate_proj.weight.grad is not None
+    assert torch.isfinite(model.blocks[0].mlp.gate_proj.weight.grad).all()
 
-    print("LLN smoke tests: PASS")
+    # The output layer is tied: no independent LM-head weight is allocated.
+    named_parameters = dict(model.named_parameters())
+    assert "token_embedding.weight" in named_parameters
+    assert not any("lm_head" in name for name in named_parameters)
+
+    print("LLN v6 dense Transformer smoke tests: PASS")
 
 
 if __name__ == "__main__":

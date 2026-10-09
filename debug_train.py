@@ -235,13 +235,13 @@ def main():
     parser.add_argument("--dim", type=int, default=256)
     parser.add_argument("--layers", type=int, default=4)
     parser.add_argument("--heads", type=int, default=4)
+    parser.add_argument("--kv-heads", type=int, default=2)
+    parser.add_argument("--rope-theta", type=float, default=10000.0)
+    parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--seq-len", type=int, default=256)
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--steps", type=int, default=300)
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--recurrent-steps", type=int, default=1)
-    parser.add_argument("--output-clusters", type=int, default=120)
-    parser.add_argument("--memory-slots", type=int, default=4)
     parser.add_argument("--examples", type=int, default=8, help="Training examples; all are used over repeated batches")
     parser.add_argument("--eval-examples", type=int, default=8, help="Held-out examples immediately after the training split")
     parser.add_argument("--seed", type=int, default=1234)
@@ -254,6 +254,12 @@ def main():
         raise ValueError("examples, eval-examples, batch-size and steps must be >= 1")
     if args.heads < 1 or args.dim % args.heads:
         raise ValueError("dim must be divisible by heads")
+    if args.kv_heads < 1 or args.heads % args.kv_heads:
+        raise ValueError("kv-heads must be positive and divide heads")
+    if args.rope_theta <= 0:
+        raise ValueError("rope-theta must be positive")
+    if not 0.0 <= args.dropout < 1.0:
+        raise ValueError("dropout must be in [0, 1)")
     if args.seq_len < 8:
         raise ValueError("seq-len must be at least 8")
 
@@ -266,7 +272,7 @@ def main():
         raise RuntimeError("CUDA requested but unavailable")
     dtype = pick_dtype(args.dtype)
 
-    word_to_id, id_to_word, token_types, meta = load_dictionary(args.dictionary, with_metadata=True)
+    word_to_id, id_to_word, _, _ = load_dictionary(args.dictionary, with_metadata=True)
     records = load_records(args.dataset)
     required = args.examples + args.eval_examples
     if len(records) < required:
@@ -281,13 +287,16 @@ def main():
     x0, y0, sections0 = batch_from_indices(train_encoded, [0], 1, device, args.seq_len)
 
     model_cfg = {
-        "vocab_size": len(word_to_id), "dim": args.dim, "layers": args.layers, "heads": args.heads,
-        "max_seq_len": args.seq_len, "recurrent_steps": args.recurrent_steps,
-        "output_clusters": args.output_clusters, "memory_slots": args.memory_slots,
-        "type_count": int(meta.get("type_count", 6)),
+        "vocab_size": len(word_to_id),
+        "dim": args.dim,
+        "layers": args.layers,
+        "heads": args.heads,
+        "kv_heads": args.kv_heads,
+        "max_seq_len": args.seq_len,
+        "dropout": args.dropout,
+        "rope_theta": args.rope_theta,
     }
     model = LLN(**model_cfg).to(device=device, dtype=dtype)
-    model.set_token_types(token_types)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.0)
 
     print("=" * 72)
@@ -299,7 +308,7 @@ def main():
     print(f"vocab={len(word_to_id):,} dataset_records={len(records):,}")
     print(f"train_examples={len(train_encoded)} heldout_examples={len(eval_encoded)}")
     print(f"batch_size={args.batch_size} seq_len={args.seq_len} steps={args.steps} lr={args.lr:g}")
-    print(f"recurrent_steps={args.recurrent_steps} output_clusters={args.output_clusters} memory_slots={args.memory_slots}")
+    print(f"attention_heads={args.heads} kv_heads={args.kv_heads} rope_theta={args.rope_theta:g}")
     print(f"loss_weights=think:{1.0 if args.no_think_weight else 0.25:g} answer:1 prompt:0")
     print("shuffle=train_each_epoch_without_replacement fixed_batch=no")
 
