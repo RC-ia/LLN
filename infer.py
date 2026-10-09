@@ -44,11 +44,13 @@ def main():
     checkpoint = torch.load(args.model, map_location=device, weights_only=True)
     cfg = checkpoint["config"].copy()
     tokenizer, id_to_token = load_tokenizer(args.tokenizer)
+    architecture_variant = cfg.get("architecture_variant", "v6-standard")
+    expected_architecture_version = 7 if architecture_variant == "v7-center-test" else LLN.ARCHITECTURE_VERSION
     saved_architecture_version = cfg.get("architecture_version")
-    if saved_architecture_version is not None and saved_architecture_version != LLN.ARCHITECTURE_VERSION:
+    if saved_architecture_version is not None and saved_architecture_version != expected_architecture_version:
         raise ValueError(
             f"checkpoint architecture version {saved_architecture_version} does not match "
-            f"runtime version {LLN.ARCHITECTURE_VERSION}"
+            f"expected version {expected_architecture_version} for {architecture_variant}"
         )
 
     saved_tokenizer_hash = cfg.get("tokenizer_fingerprint")
@@ -61,7 +63,7 @@ def main():
 
     model_keys = {
         "vocab_size", "dim", "layers", "heads", "kv_heads", "max_seq_len",
-        "dropout", "rope_theta",
+        "dropout", "rope_theta", "architecture_variant",
     }
     cfg = {key: value for key, value in cfg.items() if key in model_keys}
 
@@ -84,7 +86,8 @@ def main():
         stop_ids={token_id(tokenizer, "</ANSWER>"), token_id(tokenizer, "<EOS>")},
     )[0].tolist()
 
-    print("architecture_version:", LLN.ARCHITECTURE_VERSION)
+    print("architecture_tag:", model.architecture_variant)
+    print("architecture_version:", expected_architecture_version)
     print("dtype:", model_dtype)
     print("attention_heads:", model.heads)
     print("kv_heads:", model.kv_heads)
