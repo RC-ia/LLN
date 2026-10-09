@@ -105,3 +105,7 @@ Os smoke tests cobrem equivalência da geração com e sem KV cache, causalidade
 2. Criar um conjunto de validação fixo e garantir que nenhum exemplo de avaliação entre no treino.
 3. Comparar a baseline com a memória latente, os especialistas low-rank e a recorrência, um componente de cada vez.
 4. Medir loss de validação, cobertura textual, tokens/s e pico de memória com o mesmo orçamento de treinamento.
+
+## Architecture experiments
+
+The default architecture remains LLN v6. An experimental v7 preset is available for controlled comparison: `--architecture v7-center-test` uses 12 layers and expands the SwiGLU feed-forward width in the six central layers. See [the experiment guide](docs/architecture-experiments.md) for matched 2,000-step commands and checkpoint details.
