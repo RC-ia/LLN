@@ -164,9 +164,17 @@ class CausalSelfAttention(nn.Module):
 class SwiGLU(nn.Module):
     """Llama-style gated feed-forward network."""
 
-    def __init__(self, dim: int, dropout: float = 0.0, multiple_of: int = 64):
+    def __init__(
+        self,
+        dim: int,
+        dropout: float = 0.0,
+        multiple_of: int = 64,
+        hidden_multiplier: float = 1.0,
+    ):
         super().__init__()
-        hidden_dim = math.ceil((8 * dim / 3) / multiple_of) * multiple_of
+        if hidden_multiplier <= 0:
+            raise ValueError("hidden_multiplier must be positive")
+        hidden_dim = math.ceil((8 * dim / 3 * hidden_multiplier) / multiple_of) * multiple_of
         self.gate_proj = nn.Linear(dim, hidden_dim, bias=False)
         self.up_proj = nn.Linear(dim, hidden_dim, bias=False)
         self.down_proj = nn.Linear(hidden_dim, dim, bias=False)
@@ -184,6 +192,7 @@ class TransformerBlock(nn.Module):
         kv_heads: int,
         dropout: float = 0.0,
         rope_theta: float = 10_000.0,
+        ffn_multiplier: float = 1.0,
     ):
         super().__init__()
         self.input_layernorm = RMSNorm(dim)
@@ -195,7 +204,7 @@ class TransformerBlock(nn.Module):
             rope_theta=rope_theta,
         )
         self.post_attention_layernorm = RMSNorm(dim)
-        self.mlp = SwiGLU(dim, dropout=dropout)
+        self.mlp = SwiGLU(dim, dropout=dropout, hidden_multiplier=ffn_multiplier)
 
     def forward(
         self, x: torch.Tensor, return_kv: bool = False
@@ -241,8 +250,17 @@ class LLN(nn.Module):
         max_seq_len: int = 256,
         dropout: float = 0.0,
         rope_theta: float = 10_000.0,
+        architecture_variant: str = "v6-standard",
     ):
         super().__init__()
+        if architecture_variant not in {"v6-standard", "v7-center-test"}:
+            raise ValueError(f"unknown architecture_variant: {architecture_variant}")
+        if architecture_variant == "v7-center-test" and (
+            dim, layers, heads, kv_heads
+        ) != (768, 12, 12, 4):
+            raise ValueError(
+                "v7-center-test requires dim=768, layers=12, heads=12, kv_heads=4"
+            )
         if vocab_size < 1:
             raise ValueError("vocab_size must be positive")
         if dim < 1 or layers < 1:
@@ -264,6 +282,7 @@ class LLN(nn.Module):
         self.max_seq_len = max_seq_len
         self.dropout = dropout
         self.rope_theta = rope_theta
+        self.architecture_variant = architecture_variant
 
         self.token_embedding = nn.Embedding(vocab_size, dim)
         self.embedding_dropout = nn.Dropout(dropout)
@@ -275,8 +294,13 @@ class LLN(nn.Module):
                     kv_heads=kv_heads,
                     dropout=dropout,
                     rope_theta=rope_theta,
+                    ffn_multiplier=(
+                        1.5
+                        if architecture_variant == "v7-center-test" and 3 <= layer_idx <= 8
+                        else 1.0
+                    ),
                 )
-                for _ in range(layers)
+                for layer_idx in range(layers)
             ]
         )
         self.norm = RMSNorm(dim)
