@@ -68,6 +68,12 @@ def main():
         assert logits.shape == (ids.size(0), ids.size(1), vocab_size)
         assert loss is not None and torch.isfinite(loss)
 
+        # Future tokens must not influence logits at earlier causal positions.
+        changed = ids.clone()
+        changed[:, 4:] = torch.flip(changed[:, 4:], dims=[1])
+        changed_logits, _ = model(changed)
+        assert torch.allclose(logits[:, :4], changed_logits[:, :4], atol=1e-5, rtol=1e-5)
+
         weights = torch.ones_like(ids, dtype=torch.float32)
         weights[:, :2] = 0.0
         _, weighted_loss = model(ids, ids, loss_weights=weights)
