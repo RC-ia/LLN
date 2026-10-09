@@ -387,6 +387,6 @@ def decode_ids(ids: list[int], tokenizer: Tokenizer) -> str:
             else:
                 segment.append(idx)
         flush_segment()
-        return re.sub(r"\\s+", " ", "".join(chunks)).strip()
+        return re.sub(r"\s+", " ", "".join(chunks)).strip()
     except Exception as exc:
         raise ValueError("Could not decode IDs with the supplied LLN tokenizer") from exc
