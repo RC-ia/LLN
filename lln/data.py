@@ -5,6 +5,7 @@ import re
 from pathlib import Path
 
 import torch
+from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
 
 SPECIAL_TOKENS = [
     "<PAD>", "<BOS>", "<EOS>", "<UNK>",
@@ -12,7 +13,9 @@ SPECIAL_TOKENS = [
     "<ANSWER>", "</ANSWER>",
 ]
 DEFAULT_DATASET = Path("data/dataset.json")
-DEFAULT_DICTIONARY = Path("data/dictionary.json")
+DEFAULT_TOKENIZER = Path("data/tokenizer.json")
+# Backward-compatible constant name; the artifact is now a tokenizer JSON, not a word dictionary.
+DEFAULT_DICTIONARY = DEFAULT_TOKENIZER
 
 SECTION_PROMPT = 0
 SECTION_THINK = 1
@@ -55,37 +58,96 @@ def classify_token(token: str) -> int:
     return TYPE_WORD
 
 
-def build_dictionary_metadata(word_to_id: dict[str, int]) -> dict:
-    token_types = [TYPE_SPECIAL] * len(word_to_id)
-    for token, idx in word_to_id.items():
-        token_types[int(idx)] = classify_token(token)
-    return {
-        "version": 1,
-        "type_count": len(TYPE_NAMES),
-        "type_names": {str(k): v for k, v in TYPE_NAMES.items()},
-        "token_types": token_types,
-    }
+def tokenizer_fingerprint(tokenizer: Tokenizer) -> str:
+    """Fingerprint vocabulary, merges, pre-tokenization, decoder and special tokens."""
+    payload = tokenizer.to_str()
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def dictionary_fingerprint(word_to_id: dict[str, int]) -> str:
+def dictionary_fingerprint(value) -> str:
+    """Compatibility helper; fingerprints tokenizer JSON or a legacy ID mapping."""
+    if hasattr(value, "to_str"):
+        return tokenizer_fingerprint(value)
     payload = json.dumps(
-        sorted((str(token), int(idx)) for token, idx in word_to_id.items()),
+        sorted((str(token), int(idx)) for token, idx in value.items()),
         ensure_ascii=False,
         separators=(",", ":"),
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def metadata_path(dictionary_path: str | Path) -> Path:
-    dictionary_path = Path(dictionary_path)
-    return dictionary_path.with_suffix(".meta.json")
+def token_id(tokenizer: Tokenizer, token: str) -> int:
+    value = tokenizer.token_to_id(token)
+    if value is None:
+        raise ValueError(f"Tokenizer is missing required special token {token!r}")
+    return int(value)
 
 
-def save_dictionary_metadata(dictionary_path: str | Path, word_to_id: dict[str, int]) -> dict:
-    metadata = build_dictionary_metadata(word_to_id)
-    path = metadata_path(dictionary_path)
-    path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    return metadata
+def load_tokenizer(path: str | Path = DEFAULT_TOKENIZER) -> tuple[Tokenizer, dict[int, str]]:
+    """Load a saved ByteLevel BPE tokenizer and validate stable special-token IDs."""
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Tokenizer not found: {path}. Train it first with "
+            f"'python create_ids.py data/dataset.json --output {path}'."
+        )
+    try:
+        tokenizer = Tokenizer.from_file(str(path))
+    except Exception as exc:
+        raise ValueError(
+            f"{path} is not a valid LLN tokenizer JSON. It may be a legacy word dictionary; "
+            "train a BPE tokenizer with create_ids.py."
+        ) from exc
+
+    for expected_id, special in enumerate(SPECIAL_TOKENS):
+        actual_id = tokenizer.token_to_id(special)
+        if actual_id != expected_id:
+            raise ValueError(
+                f"Incompatible tokenizer: {special} must have ID {expected_id}, got {actual_id}. "
+                "Retrain it using create_ids.py and use the same tokenizer for training and inference."
+            )
+    id_to_token = {int(idx): str(token) for token, idx in tokenizer.get_vocab().items()}
+    return tokenizer, id_to_token
+
+
+def train_tokenizer_from_dataset(
+    dataset_path: str | Path,
+    tokenizer_path: str | Path = DEFAULT_TOKENIZER,
+    vocab_size: int = 8000,
+    min_frequency: int = 2,
+) -> Tokenizer:
+    """Train deterministic ByteLevel BPE so unseen words can be composed from subwords/bytes."""
+    min_vocab_size = len(SPECIAL_TOKENS) + len(pre_tokenizers.ByteLevel.alphabet())
+    if vocab_size < min_vocab_size:
+        raise ValueError(
+            f"vocab_size must be at least {min_vocab_size} to reserve special tokens and byte alphabet"
+        )
+    if min_frequency < 1:
+        raise ValueError("min_frequency must be >= 1")
+
+    records = load_records(dataset_path)
+    corpus = record_texts(records)
+    tokenizer = Tokenizer(models.BPE(unk_token="<UNK>"))
+    tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    tokenizer.decoder = decoders.ByteLevel()
+
+    trainer = trainers.BpeTrainer(
+        vocab_size=vocab_size,
+        min_frequency=min_frequency,
+        special_tokens=SPECIAL_TOKENS,
+        initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
+        show_progress=False,
+    )
+    tokenizer.train_from_iterator(corpus, trainer=trainer)
+
+    for expected_id, special in enumerate(SPECIAL_TOKENS):
+        if tokenizer.token_to_id(special) != expected_id:
+            raise RuntimeError(f"BPE trainer assigned an unexpected ID to special token {special}")
+
+    path = Path(tokenizer_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tokenizer.save(str(path), pretty=True)
+    return tokenizer
 
 
 def load_records(dataset_path: str | Path) -> list[tuple[str, str | None, str]]:
@@ -127,84 +189,51 @@ def record_texts(records: list[tuple[str, str | None, str]]) -> list[str]:
     return texts
 
 
-def create_dictionary_from_dataset(dataset_path: str | Path, dictionary_path: str | Path = DEFAULT_DICTIONARY):
-    records = load_records(dataset_path)
-    words = " ".join(record_texts(records)).split()
-    word_to_id = {token: i for i, token in enumerate(SPECIAL_TOKENS)}
-    for word in sorted(set(words)):
-        if word not in word_to_id:
-            word_to_id[word] = len(word_to_id)
-
-    dictionary_path = Path(dictionary_path)
-    dictionary_path.parent.mkdir(parents=True, exist_ok=True)
-    dictionary_path.write_text(json.dumps(word_to_id, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    save_dictionary_metadata(dictionary_path, word_to_id)
-    return word_to_id
+def encode_text(text: str, tokenizer: Tokenizer) -> list[int]:
+    return tokenizer.encode(normalize_text(text), add_special_tokens=False).ids
 
 
-def load_dictionary(path: str | Path, with_metadata: bool = False):
-    path = Path(path)
-    raw = json.loads(path.read_text(encoding="utf-8"))
-    word_to_id = {str(k): int(v) for k, v in raw.items()}
-    id_to_word = {v: k for k, v in word_to_id.items()}
-    if not with_metadata:
-        return word_to_id, id_to_word
-
-    meta_path = metadata_path(path)
-    metadata = None
-    if meta_path.exists():
-        metadata = json.loads(meta_path.read_text(encoding="utf-8"))
-    if not isinstance(metadata, dict) or len(metadata.get("token_types", [])) != len(word_to_id):
-        metadata = build_dictionary_metadata(word_to_id)
-        meta_path.parent.mkdir(parents=True, exist_ok=True)
-        meta_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    token_types = [int(v) for v in metadata["token_types"]]
-    return word_to_id, id_to_word, token_types, metadata
-
-
-def encode_text(text: str, word_to_id: dict[str, int]) -> list[int]:
-    return [word_to_id.get(word, word_to_id["<UNK>"]) for word in normalize_text(text).split()]
-
-
-def encode_record(record: tuple[str, str | None, str], word_to_id: dict[str, int]) -> tuple[list[int], list[int]]:
+def encode_record(
+    record: tuple[str, str | None, str], tokenizer: Tokenizer
+) -> tuple[list[int], list[int]]:
     user_text, reasoning, answer = record
-    ids = [word_to_id["<BOS>"], word_to_id["<USER>"]]
+    ids = [token_id(tokenizer, "<BOS>"), token_id(tokenizer, "<USER>")]
     sections = [SECTION_PROMPT, SECTION_PROMPT]
 
-    user_ids = encode_text(user_text, word_to_id)
+    user_ids = encode_text(user_text, tokenizer)
     ids += user_ids
     sections += [SECTION_PROMPT] * len(user_ids)
-    ids.append(word_to_id["</USER>"])
+    ids.append(token_id(tokenizer, "</USER>"))
     sections.append(SECTION_PROMPT)
 
     if reasoning:
-        ids.append(word_to_id["<THINK>"])
+        ids.append(token_id(tokenizer, "<THINK>"))
         sections.append(SECTION_THINK)
-        think_ids = encode_text(reasoning, word_to_id)
+        think_ids = encode_text(reasoning, tokenizer)
         ids += think_ids
         sections += [SECTION_THINK] * len(think_ids)
-        ids.append(word_to_id["</THINK>"])
+        ids.append(token_id(tokenizer, "</THINK>"))
         sections.append(SECTION_THINK)
 
-    ids.append(word_to_id["<ANSWER>"])
+    ids.append(token_id(tokenizer, "<ANSWER>"))
     sections.append(SECTION_ANSWER)
-    answer_ids = encode_text(answer, word_to_id)
+    answer_ids = encode_text(answer, tokenizer)
     ids += answer_ids
     sections += [SECTION_ANSWER] * len(answer_ids)
-    ids.append(word_to_id["</ANSWER>"])
+    ids.append(token_id(tokenizer, "</ANSWER>"))
     sections.append(SECTION_ANSWER)
-    ids.append(word_to_id["<EOS>"])
+    ids.append(token_id(tokenizer, "<EOS>"))
     sections.append(SECTION_ANSWER)
     return ids, sections
 
 
-def encode_prompt(text: str, word_to_id: dict[str, int]) -> list[int]:
+def encode_prompt(text: str, tokenizer: Tokenizer) -> list[int]:
     return [
-        word_to_id["<BOS>"],
-        word_to_id["<USER>"],
-        *encode_text(text, word_to_id),
-        word_to_id["</USER>"],
-        word_to_id["<THINK>"],
+        token_id(tokenizer, "<BOS>"),
+        token_id(tokenizer, "<USER>"),
+        *encode_text(text, tokenizer),
+        token_id(tokenizer, "</USER>"),
+        token_id(tokenizer, "<THINK>"),
     ]
 
 
@@ -244,15 +273,24 @@ def _compact_record(ids: list[int], sections: list[int], max_len: int) -> tuple[
 
 def build_dataset(
     dataset_path: str | Path = DEFAULT_DATASET,
-    dictionary_path: str | Path = DEFAULT_DICTIONARY,
+    tokenizer_path: str | Path = DEFAULT_TOKENIZER,
     repeats: int = 1,
     seed: int = 1234,
     return_sections: bool = False,
     max_len: int | None = None,
+    vocab_size: int = 8000,
+    min_frequency: int = 2,
 ):
     records = load_records(dataset_path)
-    word_to_id = create_dictionary_from_dataset(dataset_path, dictionary_path)
-    sequences = [encode_record(record, word_to_id) for record in records]
+    tokenizer_path = Path(tokenizer_path)
+    # Bootstrap once for a fresh checkout. Existing tokenizers are never silently retrained.
+    if not tokenizer_path.exists():
+        print(f"Tokenizer not found; training ByteLevel BPE at {tokenizer_path}")
+        train_tokenizer_from_dataset(
+            dataset_path, tokenizer_path, vocab_size=vocab_size, min_frequency=min_frequency
+        )
+    tokenizer, _ = load_tokenizer(tokenizer_path)
+    sequences = [encode_record(record, tokenizer) for record in records]
 
     if max_len is not None:
         sequences = [_compact_record(ids, sec, max_len + 1) for ids, sec in sequences]
@@ -322,13 +360,10 @@ def make_batch(data, batch_size: int, seq_len: int, device, sections=None, indic
     batch_sections = torch.tensor(w_rows, dtype=torch.float32, device=device)
     return x, y, batch_sections
 
-def decode_ids(ids: list[int], id_to_word: dict[int, str]) -> str:
-    words = []
-    for idx in ids:
-        word = id_to_word.get(int(idx), "<UNK>")
-        if word in {"<BOS>", "<PAD>"}:
-            continue
-        words.append(word)
-        if word == "<EOS>":
-            break
-    return " ".join(words)
+def decode_ids(ids: list[int], tokenizer: Tokenizer) -> str:
+    """Decode BPE IDs into readable text, omitting registered control tokens."""
+    values = [int(idx) for idx in ids]
+    try:
+        return tokenizer.decode(values, skip_special_tokens=True).strip()
+    except Exception as exc:
+        raise ValueError("Could not decode IDs with the supplied LLN tokenizer") from exc
