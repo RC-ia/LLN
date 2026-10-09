@@ -6,7 +6,7 @@ from pathlib import Path
 
 import torch
 
-from lln.data import build_dataset, dictionary_fingerprint, load_dictionary, make_batch
+from lln.data import build_dataset, load_tokenizer, make_batch, tokenizer_fingerprint
 from lln.model import LLN, parameter_count, parameter_size_mb
 
 
@@ -97,7 +97,8 @@ def sync_cuda(device: torch.device) -> None:
 def main():
     parser = argparse.ArgumentParser(description="Train LLN on bounded complete examples")
     parser.add_argument("--dataset", default="data/dataset.json")
-    parser.add_argument("--dictionary", default="data/dictionary.json")
+    parser.add_argument("--tokenizer", "--dictionary", dest="tokenizer", default="data/tokenizer.json",
+                        help="Path to the saved ByteLevel BPE tokenizer JSON")
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
     parser.add_argument("--dtype", default="float16", choices=["float32", "float16", "bfloat16"])
     parser.add_argument("--dim", type=int, default=512)
@@ -155,17 +156,17 @@ def main():
 
     data = build_dataset(
         args.dataset,
-        args.dictionary,
+        args.tokenizer,
         repeats=args.repeats,
         seed=args.seed,
         max_len=args.seq_len,
         return_sections=True,
     )
-    word_to_id, _, _, dictionary_meta = load_dictionary(args.dictionary, with_metadata=True)
-    dictionary_hash = dictionary_fingerprint(word_to_id)
+    tokenizer, _ = load_tokenizer(args.tokenizer)
+    tokenizer_hash = tokenizer_fingerprint(tokenizer)
 
     model_cfg = {
-        "vocab_size": len(word_to_id),
+        "vocab_size": tokenizer.get_vocab_size(),
         "dim": args.dim,
         "layers": args.layers,
         "heads": args.heads,
@@ -191,8 +192,8 @@ def main():
         if comparable != model_cfg:
             print("checkpoint architecture/vocabulary or sequence length differs; starting a new model")
             checkpoint = None
-        elif saved_cfg.get("dictionary_fingerprint") != dictionary_hash:
-            print("checkpoint dictionary mapping differs from current dictionary; starting a new model")
+        elif saved_cfg.get("tokenizer_fingerprint") != tokenizer_hash:
+            print("checkpoint tokenizer differs from current tokenizer; starting a new model")
             checkpoint = None
         elif saved_cfg.get("architecture_version") != ARCHITECTURE_VERSION:
             print("checkpoint uses an older architecture; starting a new model")
@@ -252,11 +253,11 @@ def main():
         print("parallel_training=disabled")
     print(f"parameters={n_params:,} model_weight_size={mb:.1f} MB")
     print(f"master_weight_size={master_mb:.1f} MB")
-    print(f"vocab={len(word_to_id):,} records={len(data):,}")
+    print(f"vocab={tokenizer.get_vocab_size():,} records={len(data):,}")
+    print(f"tokenizer={args.tokenizer} fingerprint={tokenizer_hash[:12]}")
     print(f"seq_len={args.seq_len} batch_size={args.batch_size}")
     print(f"attention_heads={args.heads} kv_heads={args.kv_heads} rope_theta={args.rope_theta:g}")
-    print(f"dictionary_metadata_version={dictionary_meta.get('version', 1)}")
-    print(f"loss_weights=prompt:0 think:{args.think_weight:g} answer:{args.answer_weight:g}")
+     print(f"loss_weights=prompt:0 think:{args.think_weight:g} answer:{args.answer_weight:g}")
     print("long_record_policy=preserve_prompt_and_answer_truncate_think")
     print("optimizer=AdamW fp32_master_params")
     print(f"architecture_version={ARCHITECTURE_VERSION}")
@@ -386,8 +387,8 @@ def main():
         "epoch_cursor": cursor,
         "config": {
             **model_cfg,
-            "dictionary": str(args.dictionary),
-            "dictionary_fingerprint": dictionary_hash,
+            "tokenizer": str(args.tokenizer),
+            "tokenizer_fingerprint": tokenizer_hash,
             "dataset": str(args.dataset),
             "loss_scheme_version": LOSS_SCHEME_VERSION,
             "architecture_version": ARCHITECTURE_VERSION,
